@@ -33,12 +33,12 @@ const project=ref<Project>(emptyProject()),history=new CommandHistory(project.va
 const worker=new Worker(new URL('../workers/pipeline.worker.ts',import.meta.url),{type:'module'})
 const sourcePixels=ref<Uint8ClampedArray|null>(null),preview=ref<Uint8ClampedArray|null>(null),correctedPixels=ref<Uint8ClampedArray|null>(null)
 const compareResults=ref<WorkerResult[]>([]),thumbnailMap=ref<Record<string,Uint8Array>>({})
-const selectedLayerId=ref(''),selectedConstraintId=ref(''),view=ref<DebugView>('corrected'),compareMode=ref(false)
+const selectedLayerId=ref(''),selectedConstraintId=ref(''),selectedHintId=ref(''),view=ref<DebugView>('corrected'),compareMode=ref(false)
 const selectedPresetIds=ref<string[]>(['shared-context','spatial-only','color-context'])
 const addMode=ref<'select'|'new-layer'|'constraint'|'include'|'exclude'>('select')
 const statusKey=ref<TranslationKey>('statusLoadPhoto'),statusVars=ref<Record<string,string|number>>({}),status=computed(()=>t(statusKey.value,statusVars.value))
 const isRendering=ref(false),zoom=ref(1),inspectorTab=ref<'activation'|'transform'>('activation'),helpOpen=ref(false),headerMenuOpen=ref(false)
-const errorKey=ref<TranslationKey|null>(null),errorVars=ref<Record<string,string|number>>({}),errorMessage=computed(()=>errorKey.value?t(errorKey.value,errorVars.value):''),draggingConstraint=ref(''),dragPosition=ref<{x:number;y:number}|null>(null)
+const errorKey=ref<TranslationKey|null>(null),errorVars=ref<Record<string,string|number>>({}),errorMessage=computed(()=>errorKey.value?t(errorKey.value,errorVars.value):''),draggingConstraint=ref(''),dragPosition=ref<{x:number;y:number}|null>(null),draggingHint=ref(''),hintDragPosition=ref<{x:number;y:number}|null>(null)
 const loadedImageFingerprint=ref('')
 const panMode=ref(false),pan=ref({x:0,y:0})
 const canvasViewport=ref<HTMLDivElement|null>(null),viewportSize=ref({width:0,height:0})
@@ -61,6 +61,7 @@ const stageSize=computed(()=>{
 })
 const rgbHex=(color:{r:number;g:number;b:number})=>'#'+linearToEncodedRgb(color).map(value=>Math.round(value*255).toString(16).padStart(2,'0')).join('')
 const markerPosition=(position:{x:number;y:number})=>draggingConstraint.value===selectedConstraintId.value&&dragPosition.value?dragPosition.value:position
+const hintMarkerPosition=(hintId:string,position:{x:number;y:number})=>draggingHint.value===hintId&&hintDragPosition.value?hintDragPosition.value:position
 const markerStyle=(position:{x:number;y:number})=>({left:`${position.x*100}%`,top:`${position.y*100}%`})
 const findLayer=(id:string)=>project.value.layers.find(layer=>layer.id===id)
 function setStatus(key:TranslationKey,values:Record<string,string|number>={}){statusKey.value=key;statusVars.value=values}
@@ -165,7 +166,14 @@ function onKey(event:KeyboardEvent){
   const target=event.target as HTMLElement|null
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='z'&&!target?.matches('input,textarea')){event.preventDefault();event.shiftKey?redo():undo()}
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='y'){event.preventDefault();redo()}
-  if(event.key==='Escape'){addMode.value='select';draggingConstraint.value='';helpOpen.value=false;headerMenuOpen.value=false}
+  if((event.key==='Delete'||event.key==='Backspace')&&!target?.matches('input,textarea,select,[contenteditable="true"]')){
+    if(selectedHintId.value){event.preventDefault();removeHint(selectedLayerId.value,selectedHintId.value)}
+    else if(selectedConstraintId.value){
+      const layer=project.value.layers.find(item=>item.constraints.some(constraint=>constraint.id===selectedConstraintId.value))
+      if(layer){event.preventDefault();deleteConstraint(layer.id,selectedConstraintId.value)}
+    }
+  }
+  if(event.key==='Escape'){addMode.value='select';draggingConstraint.value='';draggingHint.value='';hintDragPosition.value=null;helpOpen.value=false;headerMenuOpen.value=false}
 }
 onMounted(()=>{
   document.documentElement.lang=locale.value
@@ -204,12 +212,13 @@ function onStageClick(event:MouseEvent){
   if(addMode.value==='include'||addMode.value==='exclude'){
     if(!activeLayer.value)return
     const hint:ActivationHint={id:crypto.randomUUID(),position,type:addMode.value,strength:0.85,radius:activeLayer.value.activationConfig.hintRadius}
-    updateLayer(activeLayer.value.id,`Add ${hint.type} hint`,layer=>({...layer,activationHints:[...layer.activationHints,hint]}));addMode.value='select';return
+    updateLayer(activeLayer.value.id,`Add ${hint.type} hint`,layer=>({...layer,activationHints:[...layer.activationHints,hint]}));selectedConstraintId.value='';selectedHintId.value=hint.id;addMode.value='select';return
   }
   if(addMode.value==='new-layer'||addMode.value==='constraint'||!activeLayer.value){addConstraintAt(position);return}
 }
 function startConstraintDrag(event:PointerEvent,constraintId:string){event.stopPropagation();selectedConstraintId.value=constraintId;draggingConstraint.value=constraintId;dragPosition.value=null;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)}
-function movePointer(event:PointerEvent){if(draggingConstraint.value)dragPosition.value=stagePosition(event)}
+function startHintDrag(event:PointerEvent,layerId:string,hintId:string){event.stopPropagation();selectHint(layerId,hintId);draggingHint.value=hintId;hintDragPosition.value=null;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)}
+function movePointer(event:PointerEvent){if(draggingConstraint.value)dragPosition.value=stagePosition(event);if(draggingHint.value)hintDragPosition.value=stagePosition(event)}
 function startPan(event:PointerEvent){
   if(event.target instanceof Element&&event.target.closest('.constraint-marker'))return
   if(!(panMode.value&&event.button===0)&&event.button!==1)return
@@ -223,6 +232,11 @@ function movePan(event:PointerEvent){
 }
 function endPan(){panStart=undefined}
 function endPointer(event:PointerEvent){
+  if(draggingHint.value){
+    const hintId=draggingHint.value,position=stagePosition(event),layer=project.value.layers.find(item=>item.activationHints.some(hint=>hint.id===hintId))
+    if(layer)commit('Move activation hint',current=>({...current,layers:current.layers.map(item=>item.id===layer.id?{...item,activationHints:item.activationHints.map(hint=>hint.id===hintId?{...hint,position}:hint)}:item)}))
+    draggingHint.value='';hintDragPosition.value=null;return
+  }
   if(!draggingConstraint.value||!sourcePixels.value)return
   const constraintId=draggingConstraint.value,position=stagePosition(event),layer=project.value.layers.find(l=>l.constraints.some(c=>c.id===constraintId))
   if(layer){
@@ -232,7 +246,7 @@ function endPointer(event:PointerEvent){
   }
   draggingConstraint.value='';dragPosition.value=null
 }
-function pickConstraint(layerId:string,id:string){selectedLayerId.value=layerId;selectedConstraintId.value=id;addMode.value='select'}
+function pickConstraint(layerId:string,id:string){selectedLayerId.value=layerId;selectedConstraintId.value=id;selectedHintId.value='';addMode.value='select'}
 function deleteConstraint(layerId:string,id:string){
   commit('Remove constraint',current=>({...current,layers:current.layers.map(layer=>layer.id===layerId?{...layer,constraints:layer.constraints.filter(c=>c.id!==id)}:layer)}))
   const next=findLayer(layerId)?.constraints[0];selectedConstraintId.value=next?.id??''
@@ -277,7 +291,8 @@ function setAnalysisSize(event:Event){if(activeLayer.value){const value=Number((
 function setUpsampling(event:Event){if(activeLayer.value){const value=(event.target as HTMLSelectElement).value as 'bilinear'|'joint-bilateral';updateLayer(activeLayer.value.id,'Change activation upsampling',layer=>({...layer,activationConfig:{...layer.activationConfig,upsampling:value}}))}}
 function setAggregator(event:Event){if(activeLayer.value){const type=(event.target as HTMLSelectElement).value as 'probabilistic-or'|'smooth-max';updateLayer(activeLayer.value.id,'Change activation aggregator',layer=>({...layer,activationAggregator:{...layer.activationAggregator,type}}))}}
 function setCompositor(event:Event){const compositor=(event.target as HTMLSelectElement).value as Project['pipeline']['compositor'];commit('Change compositor',current=>({...current,pipeline:{...current.pipeline,compositor}}))}
-function removeHint(layerId:string,hintId:string){updateLayer(layerId,'Remove activation hint',layer=>({...layer,activationHints:layer.activationHints.filter(h=>h.id!==hintId)}))}
+function selectHint(layerId:string,hintId:string){selectedLayerId.value=layerId;selectedConstraintId.value='';selectedHintId.value=hintId;addMode.value='select'}
+function removeHint(layerId:string,hintId:string){updateLayer(layerId,'Remove activation hint',layer=>({...layer,activationHints:layer.activationHints.filter(h=>h.id!==hintId)}));if(selectedHintId.value===hintId)selectedHintId.value=''}
 function setConfidence(event:Event){if(!activeLayer.value||!selectedConstraint.value)return;const confidence=Number((event.target as HTMLInputElement).value)/100,id=selectedConstraint.value.id;updateLayer(activeLayer.value.id,'Change constraint confidence',layer=>({...layer,constraints:layer.constraints.map(c=>c.id===id?{...c,confidence}:c)}))}
 function setHintStrength(layerId:string,hintId:string,event:Event){const strength=Number((event.target as HTMLInputElement).value)/100;updateLayer(layerId,'Change activation hint strength',layer=>({...layer,activationHints:layer.activationHints.map(h=>h.id===hintId?{...h,strength}:h)}))}
 function setHintRadius(layerId:string,hintId:string,event:Event){const radius=Number((event.target as HTMLInputElement).value);updateLayer(layerId,'Change activation hint radius',layer=>({...layer,activationHints:layer.activationHints.map(h=>h.id===hintId?{...h,radius}:h)}))}
@@ -298,8 +313,8 @@ function onWheel(event:WheelEvent){if(event.ctrlKey||event.metaKey){event.preven
 function thumbnailData(resultId:string,layerId:string){return thumbnailMap.value[`${resultId}:${layerId}`]}
 function thumbnailUrl(resultId:string,layerId:string){
   const data=thumbnailData(resultId,layerId)??thumbnailData(compareResults.value[0]?.id??'',layerId);if(!data)return ''
-  const canvas=document.createElement('canvas');canvas.width=48;canvas.height=48;const ctx=canvas.getContext('2d');if(!ctx)return ''
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(data.buffer,data.byteOffset,data.byteLength),48,48),0,0);return canvas.toDataURL()
+  const size=Math.sqrt(data.length/4),canvas=document.createElement('canvas');canvas.width=size;canvas.height=size;const ctx=canvas.getContext('2d');if(!ctx)return ''
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(data.buffer,data.byteOffset,data.byteLength),size,size),0,0);return canvas.toDataURL()
 }
 </script>
 
@@ -327,7 +342,7 @@ function thumbnailUrl(resultId:string,layerId:string){
         <label class="button import-button" :title="width?project.image.name:t('importPhoto')"><Upload :size="15" /> {{ width?project.image.name:t('importPhoto') }}<input type="file" accept="image/*" @change="choosePhoto"></label>
         <div v-if="!project.layers.length" class="empty-layers"><div class="empty-icon"><Layers3 :size="22" /></div><strong>{{ t('noLayers') }}</strong><p>{{ t('noLayersHelp') }}</p><button class="text-button" :disabled="!width" @click="addMode='new-layer'"><Plus :size="14" /> {{ t('startFirstCorrection') }}</button></div>
         <div v-else class="layer-list">
-          <article v-for="(layer,index) in project.layers" :key="layer.id" class="layer-card" :class="{active:selectedLayerId===layer.id,disabled:!layer.enabled}" @click="selectedLayerId=layer.id;selectedConstraintId=layer.constraints[0]?.id??''">
+          <article v-for="(layer,index) in project.layers" :key="layer.id" class="layer-card" :class="{active:selectedLayerId===layer.id,disabled:!layer.enabled}" @click="selectedLayerId=layer.id;selectedConstraintId=layer.constraints[0]?.id??'';selectedHintId=''">
             <div class="layer-card-top"><button class="visibility-toggle" :title="layer.enabled?t('disableLayer'):t('enableLayer')" @click.stop="commit('Toggle correction layer',current=>({...current,layers:current.layers.map(item=>item.id===layer.id?{...item,enabled:!item.enabled}:item)}))"><Eye v-if="layer.enabled" :size="15"/><EyeOff v-else :size="15"/></button>
               <input class="layer-name" :value="layer.name" :aria-label="t('layerName')" @click.stop @change="renameLayer(layer.id,$event)" />
               <button class="mini-icon" :title="t('moveLayerUp')" :disabled="index===0" @click.stop="reorderLayer(layer.id,-1)"><ChevronUp :size="14"/></button><button class="mini-icon" :title="t('moveLayerDown')" :disabled="index===project.layers.length-1" @click.stop="reorderLayer(layer.id,1)"><ChevronDown :size="14"/></button>
@@ -369,7 +384,7 @@ function thumbnailUrl(resultId:string,layerId:string){
           <template v-else>
             <div class="stage-frame" :class="{panning:panMode}" :style="{width:`${stageSize.width}px`,height:`${stageSize.height}px`,aspectRatio:`${width}/${height}`,transform:`translate(${pan.x}px,${pan.y}px) scale(${zoom})`}" @click="onStageClick" @pointerdown="startPan" @pointermove="movePointer($event);movePan($event)" @pointerup="endPointer($event);endPan()">
               <PreviewCanvas :pixels="preview" :width="width" :height="height" :label="t('photoViewLabel',{view:t(viewLabelKey(view))})" />
-              <template v-for="layer in project.layers" :key="layer.id"><button v-for="(constraint,index) in layer.constraints" :key="constraint.id" class="constraint-marker" :class="{active:selectedConstraintId===constraint.id&&selectedLayerId===layer.id,muted:!layer.enabled}" :style="markerStyle(markerPosition(constraint.position))" :title="t('constraintMarkerTitle',{count:index+1})" @pointerdown="startConstraintDrag($event,constraint.id)" @click.stop="pickConstraint(layer.id,constraint.id)"><span>{{ String(index+1).padStart(2,'0') }}</span></button><span v-for="hint in layer.activationHints" :key="hint.id" class="hint-marker" :class="hint.type" :style="markerStyle(hint.position)" :title="hint.type==='include'?t('includeHere'):t('excludeHere')">{{ hint.type==='include'?'+':'−' }}</span></template>
+              <template v-for="layer in project.layers" :key="layer.id"><button v-for="(constraint,index) in layer.constraints" :key="constraint.id" class="constraint-marker" :class="{active:selectedConstraintId===constraint.id&&selectedLayerId===layer.id,muted:!layer.enabled}" :style="markerStyle(markerPosition(constraint.position))" :title="t('constraintMarkerTitle',{count:index+1})" @pointerdown="startConstraintDrag($event,constraint.id)" @click.stop="pickConstraint(layer.id,constraint.id)"><span>{{ String(index+1).padStart(2,'0') }}</span></button><button v-for="hint in layer.activationHints" :key="hint.id" type="button" class="hint-marker" :class="[hint.type,{selected:selectedHintId===hint.id&&selectedLayerId===layer.id}]" :style="{...markerStyle(hintMarkerPosition(hint.id,hint.position)),pointerEvents:'auto'}" :title="hint.type==='include'?t('includeHere'):t('excludeHere')" @pointerdown="startHintDrag($event,layer.id,hint.id)" @click.stop="selectHint(layer.id,hint.id)">{{ hint.type==='include'?'+':'−' }}</button></template>
               <div v-if="addMode==='constraint'||addMode==='new-layer'" class="canvas-instruction"><MousePointer2 :size="13"/> {{ t('sampleOriginal') }}</div>
               <div v-else-if="addMode==='include'||addMode==='exclude'" class="canvas-instruction" :class="addMode"><span class="hint-symbol" :class="addMode">{{ addMode==='include'?'+':'−' }}</span> {{ addMode==='include'?t('includeClick'):t('excludeClick') }}</div>
             </div>
@@ -390,12 +405,12 @@ function thumbnailUrl(resultId:string,layerId:string){
             <template v-if="inspectorTab==='activation'">
               <section class="inspector-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('activationField') }}</span><h3>{{ t('whereApplies') }}</h3></div><span class="live-badge">{{ t('live') }}</span></div>
-                <div class="field-preview" :class="{empty:!activeLayer.constraints.length}"><div class="field-checker"></div><img v-if="thumbnailUrl('main',activeLayer.id)" :src="thumbnailUrl('main',activeLayer.id)" :alt="t('activationField')"/><div v-else class="field-empty-label"><Sparkles :size="16"/> {{ t('fieldEmpty') }}</div><div class="field-legend"><span><i class="legend-low"></i>{{ t('low') }}</span><span><i class="legend-high"></i>{{ t('high') }}</span></div></div>
+                <div class="field-preview" :class="{empty:!activeLayer.constraints.length}" :style="{aspectRatio:`${width}/${height}`}"><div class="field-checker"></div><img v-if="thumbnailUrl('main',activeLayer.id)" :src="thumbnailUrl('main',activeLayer.id)" :alt="t('activationField')"/><div v-else class="field-empty-label"><Sparkles :size="16"/> {{ t('fieldEmpty') }}</div><div class="field-legend"><span><i class="legend-low"></i>{{ t('low') }}</span><span><i class="legend-high"></i>{{ t('high') }}</span></div></div>
                 <div class="field-note"><span class="info-dot">i</span><span>{{ t('targetIndependent') }}</span></div>
               </section>
               <section class="inspector-section compact-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('seedFields') }}</span><h3>{{ t('perConstraintEvidence') }}</h3></div><span class="section-count">{{ activeLayer.constraints.length }}</span></div>
-                <button v-for="(constraint,index) in activeLayer.constraints" :key="constraint.id" class="seed-row" :class="{selected:selectedConstraintId===constraint.id}" @click="selectedConstraintId=constraint.id;view='seed'"><span class="seed-number">{{ String(index+1).padStart(2,'0') }}</span><img v-if="thumbnailUrl('main',`${activeLayer.id}:seed:${constraint.id}`)" :src="thumbnailUrl('main',`${activeLayer.id}:seed:${constraint.id}`)" alt=""/><span class="seed-color" :style="{background:rgbHex(constraint.source)}"></span><span class="seed-row-copy"><strong>{{ rgbHex(constraint.source).toUpperCase() }}</strong><small>{{ t('originalSample') }} · {{ t('confidence') }} {{ Math.round(constraint.confidence*100) }}%</small></span><ScanEye :size="14"/></button>
+                <button v-for="(constraint,index) in activeLayer.constraints" :key="constraint.id" class="seed-row" :class="{selected:selectedConstraintId===constraint.id}" @click="selectedConstraintId=constraint.id;view='seed'"><span class="seed-number">{{ String(index+1).padStart(2,'0') }}</span><span class="seed-color" :style="{background:rgbHex(constraint.source)}"></span><span class="seed-row-copy"><strong>{{ rgbHex(constraint.source).toUpperCase() }}</strong><small>{{ t('originalSample') }} · {{ t('confidence') }} {{ Math.round(constraint.confidence*100) }}%</small></span><ScanEye :size="14"/></button>
                 <div v-if="!activeLayer.constraints.length" class="inline-empty">{{ t('noConstraints') }}</div>
               </section>
               <section class="inspector-section controls-section">
@@ -424,8 +439,8 @@ function thumbnailUrl(resultId:string,layerId:string){
               </section>
               <section class="inspector-section hints-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('scopeHints') }}</span><h3>{{ t('lightweightHints') }}</h3></div></div>
-                <div v-if="activeLayer.activationHints.length" class="hint-list"><div v-for="hint in activeLayer.activationHints" :key="hint.id" class="hint-row"><span class="hint-chip" :class="hint.type">{{ hint.type==='include'?'+':'−' }}</span><span>{{ hint.type==='include'?t('includeHere'):t('excludeHere') }} · ({{ hint.position.x.toFixed(2) }}, {{ hint.position.y.toFixed(2) }})</span><b>{{ Math.round(hint.strength*100) }}%</b><button class="mini-icon" @click="removeHint(activeLayer.id,hint.id)"><X :size="13"/></button><input class="hint-range" type="range" min="0" max="100" :value="hint.strength*100" :aria-label="t('hintStrengthAria')" @input="setHintStrength(activeLayer.id,hint.id,$event)"/><input class="hint-range radius" type="range" min="0.02" max="0.35" step="0.01" :value="hint.radius??activeLayer.activationConfig.hintRadius" :aria-label="t('hintRadiusAria')" @input="setHintRadius(activeLayer.id,hint.id,$event)"/></div></div><div v-else class="hint-empty">{{ t('hintEmpty') }}</div>
-                <div class="hint-buttons"><button @click="addMode='include'"><Plus :size="13"/> {{ t('includeHere') }}</button><button @click="addMode='exclude'"><Minus :size="13"/> {{ t('excludeHere') }}</button></div>
+                <div v-if="activeLayer.activationHints.length" class="hint-list"><div v-for="hint in activeLayer.activationHints" :key="hint.id" class="hint-row" :class="{selected:selectedHintId===hint.id}" @click="selectHint(activeLayer.id,hint.id)"><span class="hint-chip" :class="hint.type">{{ hint.type==='include'?'+':'−' }}</span><span>{{ hint.type==='include'?t('includeHere'):t('excludeHere') }} · ({{ hint.position.x.toFixed(2) }}, {{ hint.position.y.toFixed(2) }})</span><b>{{ Math.round(hint.strength*100) }}%</b><button class="mini-icon" @click.stop="removeHint(activeLayer.id,hint.id)"><X :size="13"/></button><input class="hint-range" type="range" min="0" max="100" :value="hint.strength*100" :aria-label="t('hintStrengthAria')" @click.stop @input="setHintStrength(activeLayer.id,hint.id,$event)"/><input class="hint-range radius" type="range" min="0.02" max="0.35" step="0.01" :value="hint.radius??activeLayer.activationConfig.hintRadius" :aria-label="t('hintRadiusAria')" @click.stop @input="setHintRadius(activeLayer.id,hint.id,$event)"/></div></div><div v-else class="hint-empty">{{ t('hintEmpty') }}</div>
+                <div class="hint-buttons"><button :class="{active:addMode==='include'}" @click="addMode=addMode==='include'?'select':'include'"><Plus :size="13"/> {{ t('includeHere') }}</button><button :class="{active:addMode==='exclude'}" @click="addMode=addMode==='exclude'?'select':'exclude'"><Minus :size="13"/> {{ t('excludeHere') }}</button></div>
               </section>
             </template>
             <template v-else>
@@ -484,3 +499,19 @@ function thumbnailUrl(resultId:string,layerId:string){
     </section>
   </div>
 </template>
+
+<style scoped>
+.hint-marker.selected{outline:2px solid #f4f7ee;outline-offset:2px;z-index:2}
+.hint-marker{padding:0;touch-action:none;cursor:grab}
+.hint-marker:active{cursor:grabbing}
+.hint-row{cursor:pointer}
+.hint-row.selected{background:#293329}
+.hint-buttons button.active{color:#d9f2bd;background:#303c2c}
+.seed-row{display:grid!important;grid-template-columns:24px 12px minmax(0,1fr) 14px!important;column-gap:10px!important;align-items:center}
+.seed-row .seed-number{position:static!important;grid-column:1;grid-row:1;width:auto!important;margin:0!important;text-align:left;z-index:auto}
+.seed-row .seed-color{position:static!important;grid-column:2;grid-row:1;width:8px!important;height:8px!important;margin:0!important;justify-self:center}
+.seed-row .seed-row-copy{grid-column:3;min-width:0}
+.seed-row>svg{grid-column:4}
+.layer-card .strength-range{position:relative;z-index:1;display:block;width:100%;margin:8px 0 12px}
+.layer-card .constraint-list{position:relative;z-index:0}
+</style>
