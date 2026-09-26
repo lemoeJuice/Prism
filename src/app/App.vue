@@ -9,6 +9,7 @@ import PreviewCanvas from '../renderer/webgl2/PreviewCanvas.vue'
 import { encodedRgbToLinear, linearToEncodedRgb } from '../core/color'
 import { createConstraint, moveConstraint, sampleOriginalColor } from '../core/constraints'
 import { CommandHistory } from '../core/project/history'
+import { fitStageToViewport } from './fitStage'
 import { deserializeProject, fingerprintImage, serializeProject } from '../core/project'
 import { DEFAULT_PIPELINE } from '../core/types'
 import type { ActivationHint, CorrectionLayer, Project } from '../core/types'
@@ -30,8 +31,10 @@ const status=ref('Load a photo to start a correction session.'),isRendering=ref(
 const errorMessage=ref(''),draggingConstraint=ref(''),dragPosition=ref<{x:number;y:number}|null>(null)
 const loadedImageFingerprint=ref('')
 const panMode=ref(false),pan=ref({x:0,y:0})
+const canvasViewport=ref<HTMLDivElement|null>(null),viewportSize=ref({width:0,height:0})
 let requestId=0,latestRequest=0,renderTimer:number|undefined,imageReady=false
 let panStart:{x:number;y:number;originX:number;originY:number}|undefined,didPan=false
+let viewportObserver:ResizeObserver|undefined
 const width=computed(()=>project.value.image.width),height=computed(()=>project.value.image.height)
 const activeLayer=computed(()=>project.value.layers.find(layer=>layer.id===selectedLayerId.value))
 const selectedConstraint=computed(()=>activeLayer.value?.constraints.find(item=>item.id===selectedConstraintId.value))
@@ -43,10 +46,18 @@ const layerDiagnostics=computed(()=>{
   return diagnostics.find(item=>item.id===activeLayer.value?.id)??diagnostics.find(item=>item.id.startsWith(`${activeLayer.value?.id}:`))
 })
 const dimensionsLabel=computed(()=>width.value?`${width.value} × ${height.value}`:'No image')
+const stageSize=computed(()=>{
+  return fitStageToViewport(width.value,height.value,viewportSize.value.width,viewportSize.value.height,compareMode.value)
+})
 const rgbHex=(color:{r:number;g:number;b:number})=>'#'+linearToEncodedRgb(color).map(value=>Math.round(value*255).toString(16).padStart(2,'0')).join('')
 const markerPosition=(position:{x:number;y:number})=>draggingConstraint.value===selectedConstraintId.value&&dragPosition.value?dragPosition.value:position
 const markerStyle=(position:{x:number;y:number})=>({left:`${position.x*100}%`,top:`${position.y*100}%`})
 const findLayer=(id:string)=>project.value.layers.find(layer=>layer.id===id)
+function measureCanvasViewport(){
+  if(!canvasViewport.value)return
+  const rect=canvasViewport.value.getBoundingClientRect()
+  viewportSize.value=rect.width&&rect.height?{width:Math.max(0,canvasViewport.value.clientWidth-44),height:Math.max(0,canvasViewport.value.clientHeight-44)}:{width:0,height:0}
+}
 
 function commit(label:string,reduce:(current:Project)=>Project){project.value=history.execute(label,reduce);scheduleRender()}
 function updateLayer(id:string,label:string,update:(layer:CorrectionLayer)=>CorrectionLayer){commit(label,current=>({...current,layers:current.layers.map(layer=>layer.id===id?update(layer):layer)}))}
@@ -133,8 +144,13 @@ function onKey(event:KeyboardEvent){
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='y'){event.preventDefault();redo()}
   if(event.key==='Escape'){addMode.value='select';draggingConstraint.value=''}
 }
-onMounted(()=>window.addEventListener('keydown',onKey))
-onBeforeUnmount(()=>{window.removeEventListener('keydown',onKey);worker.removeEventListener('message',onWorkerMessage);worker.terminate();if(renderTimer)window.clearTimeout(renderTimer)})
+onMounted(()=>{
+  window.addEventListener('keydown',onKey)
+  measureCanvasViewport()
+  if(typeof ResizeObserver!=='undefined'&&canvasViewport.value){viewportObserver=new ResizeObserver(measureCanvasViewport);viewportObserver.observe(canvasViewport.value)}
+  else window.addEventListener('resize',measureCanvasViewport)
+})
+onBeforeUnmount(()=>{window.removeEventListener('keydown',onKey);window.removeEventListener('resize',measureCanvasViewport);viewportObserver?.disconnect();worker.removeEventListener('message',onWorkerMessage);worker.terminate();if(renderTimer)window.clearTimeout(renderTimer)})
 
 function createNewLayer(){
   const id=crypto.randomUUID(),layer=createLayer(id,`Correction ${project.value.layers.length+1}`)
@@ -317,14 +333,14 @@ function thumbnailUrl(resultId:string,layerId:string){
           <button class="icon-button" title="Zoom out" @click="changeZoom(-0.1)"><Minus :size="15"/></button><span class="zoom-value">{{ Math.round(zoom*100) }}%</span><button class="icon-button" title="Zoom in" @click="changeZoom(0.1)"><Plus :size="15"/></button>
           <button class="compare-toggle" :class="{active:compareMode}" @click="compareMode=!compareMode"><ArrowLeftRight :size="14"/> Compare</button>
         </div>
-        <div class="canvas-viewport" @wheel="onWheel">
+        <div ref="canvasViewport" class="canvas-viewport" @wheel="onWheel">
           <div v-if="!width" class="canvas-empty">
             <div class="empty-photo-icon"><FileImage :size="30"/></div><span class="eyebrow">PRISM COLOR WORKSPACE</span><h1>Make precise corrections<br/>with fewer controls.</h1><p>Sample a color, describe what it should be, and let Prism infer where that correction belongs.</p>
             <label class="button primary"><Upload :size="15"/> Choose a photo<input type="file" accept="image/*" @change="choosePhoto"/></label>
             <span class="supported-format">Local processing · JPEG, PNG, WebP, AVIF</span>
           </div>
           <template v-else>
-            <div class="stage-frame" :class="{panning:panMode}" :style="{aspectRatio:`${width}/${height}`,transform:`translate(${pan.x}px,${pan.y}px) scale(${zoom})`}" @click="onStageClick" @pointerdown="startPan" @pointermove="movePointer($event);movePan($event)" @pointerup="endPointer($event);endPan()">
+            <div class="stage-frame" :class="{panning:panMode}" :style="{width:`${stageSize.width}px`,height:`${stageSize.height}px`,aspectRatio:`${width}/${height}`,transform:`translate(${pan.x}px,${pan.y}px) scale(${zoom})`}" @click="onStageClick" @pointerdown="startPan" @pointermove="movePointer($event);movePan($event)" @pointerup="endPointer($event);endPan()">
               <PreviewCanvas :pixels="preview" :width="width" :height="height" :label="view+' photo view'" />
               <template v-for="layer in project.layers" :key="layer.id"><button v-for="(constraint,index) in layer.constraints" :key="constraint.id" class="constraint-marker" :class="{active:selectedConstraintId===constraint.id&&selectedLayerId===layer.id,muted:!layer.enabled}" :style="markerStyle(markerPosition(constraint.position))" :title="`Constraint ${index+1}: drag to resample original color`" @pointerdown="startConstraintDrag($event,constraint.id)" @click.stop="pickConstraint(layer.id,constraint.id)"><span>{{ String(index+1).padStart(2,'0') }}</span></button><span v-for="hint in layer.activationHints" :key="hint.id" class="hint-marker" :class="hint.type" :style="markerStyle(hint.position)" :title="`${hint.type} activation hint`">{{ hint.type==='include'?'+':'−' }}</span></template>
               <div v-if="addMode==='constraint'||addMode==='new-layer'" class="canvas-instruction"><MousePointer2 :size="13"/> Click the image to sample its original color</div>

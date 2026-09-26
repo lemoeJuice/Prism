@@ -5,4 +5,5 @@
 .stage-frame.panning{cursor:grab}.stage-frame.panning:active{cursor:grabbing}
 .hint-marker{position:absolute;z-index:1;transform:translate(-50%,-50%);width:19px;height:19px;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;font:bold 13px var(--display);pointer-events:none;box-shadow:0 1px 5px #0009}.hint-marker.include{color:#d2f3ac;background:#2a3a22d9}.hint-marker.exclude{color:#f2a391;background:#45241fd9}
 .hint-row{flex-wrap:wrap}.hint-row>b{color:#bbc8b2;font:8px var(--mono)}.hint-range{width:calc(50% - 18px);margin:0 0 2px 22px}.hint-range.radius{margin-left:5px}
+.stage-frame,.canvas-workspace:has(.compare-grid) .stage-frame{width:auto;max-height:none}
 @media(max-width:1250px){.workspace-grid{grid-template-columns:265px minmax(380px,1fr) 315px}.topbar{gap:15px;padding:0 14px}.brand-lockup{width:155px}.compare-dock{gap:10px;padding:8px 10px}.compare-dock-title{min-width:190px}.baseline-hooks{max-width:210px}}
