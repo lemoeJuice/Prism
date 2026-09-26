@@ -1,22 +1,22 @@
 import { clamp01, hardClipGamut, linearToEncodedRgb, linearToOKLab, oklchChromaCompression, srgbToLinear } from '../color'
-import { aggregateActivationFields, computeSeedField, normalizeActivationAggregatorConfig, normalizeActivationConfig, type ActivationSeedTexture } from '../activation'
-import { makeAnalysisImage, multiscaleFeatureExtractor, type AnalysisImage, type FeatureMap } from '../features'
+import { aggregateActivationFields, computeSeedField, evaluateAppearanceGaussian, normalizeActivationAggregatorConfig, normalizeActivationConfig, type ActivationBreakdown, type ActivationSeedTexture } from '../activation'
+import { featureAt, featureForConstraint, makeAnalysisImage, multiscaleFeatureExtractor, type AnalysisImage, type FeatureMap } from '../features'
 import { getCompositor } from '../compositor'
 import { weightedRidgeTransform, type SolvedTransform } from '../transform'
 import type { ActivationConfig, ColorConstraint, CorrectionLayer, PipelineConfig, TransformConfig } from '../types'
 
-export type DebugView='corrected'|'original'|'split'|'difference'|'activation'|'activation-overlay'|'seed'|'dominant'|'contribution'|'total-correction'|'out-of-gamut'
+export type DebugView='corrected'|'original'|'split'|'difference'|'activation'|'activation-overlay'|'seed'|'dominant'|'dominant-seed'|'hint-contribution'|'contribution'|'total-correction'|'out-of-gamut'|'distance-color'|'distance-spatial'|'distance-context'|'distance-edge'|'distance-total'
 export interface VariantOverride {
   id:string; name:string; activation?:Partial<ActivationConfig>; transform?:Partial<TransformConfig>
   aggregator?:CorrectionLayer['activationAggregator']['type']; compositor?:PipelineConfig['compositor']; gamut?:PipelineConfig['gamut']; architecture?:PipelineConfig['architectureBaseline']
 }
 export interface LayerDebug {
-  id:string; activation:Float32Array; seeds:ActivationSeedTexture[]; contribution:Float32Array; transform:SolvedTransform
+  id:string; activation:Float32Array; seeds:ActivationSeedTexture[]; contribution:Float32Array; transform:SolvedTransform; breakdown?:ActivationBreakdown[];breakdownWidth?:number;breakdownHeight?:number;dominantSeed?:Uint8Array;hintContribution?:Float32Array
 }
 export interface PipelineOutput {
   width:number;height:number;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;debug:LayerDebug[]
   dominant:Uint8Array;outOfGamut:Uint8Array;totalMagnitude:Float32Array
-  processingMs:number;outOfGamutRate:number;variantId:string
+  processingMs:number;outOfGamutRate:number;variantId:string;runtime:{featureExtractionMs:number;activationSeedMs:number;aggregationMs:number;transformSolveMs:number;renderPreparationMs:number;renderMs:number};featureInspection?:{position:{x:number;y:number};rgb:{r:number;g:number;b:number};query:ReturnType<typeof featureAt>;seed:ReturnType<typeof featureForConstraint>;breakdown:ActivationBreakdown}
 }
 interface ActivationCacheEntry { key:string; seeds:ActivationSeedTexture[]; field:Float32Array; width:number;height:number }
 const seedCache=new Map<string,ActivationSeedTexture>()
@@ -36,22 +36,26 @@ function stable(value:unknown):string {
   return `{${Object.entries(value as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>`${JSON.stringify(k)}:${stable(v)}`).join(',')}}`
 }
 const colorKey=(c:ColorConstraint)=>({id:c.id,position:c.position,source:c.source,confidence:c.confidence})
-async function preparedActivation(image:AnalysisImage,fingerprint:string,layer:CorrectionLayer,config:ActivationConfig,aggregator:CorrectionLayer['activationAggregator'],features:FeatureMap):Promise<ActivationCacheEntry>{
+async function preparedActivation(image:AnalysisImage,fingerprint:string,layer:CorrectionLayer,config:ActivationConfig,aggregator:CorrectionLayer['activationAggregator'],features:FeatureMap):Promise<ActivationCacheEntry&{seedMs:number;aggregationMs:number}>{
   const featureKey=stable({fingerprint,width:image.width,height:image.height,config})
   const seedKeys=layer.constraints.map(c=>`${featureKey}:${stable(colorKey(c))}`)
-  const seeds=layer.constraints.map((constraint,i)=>{
+  const seedStarted=performance.now(),seeds=layer.constraints.map((constraint,i)=>{
     let seed=seedCache.get(seedKeys[i])
     if(!seed){seed=computeSeedField(features,constraint,config);cacheSet(seedCache,seedKeys[i],seed,24)}
     else cacheSet(seedCache,seedKeys[i],seed,24)
     return seed
   })
+  const seedMs=performance.now()-seedStarted
   const fieldKey=stable({seedKeys,hints:layer.activationHints,aggregator})
   let cached=fieldCache.get(fieldKey)
+  let aggregationMs=0
   if(!cached){
+    const aggregationStarted=performance.now()
     cached={key:fieldKey,seeds,field:seeds.length?aggregateActivationFields(seeds,layer.activationHints,config,aggregator):new Float32Array(features.width*features.height),width:features.width,height:features.height}
+    aggregationMs=performance.now()-aggregationStarted
     cacheSet(fieldCache,fieldKey,cached,12)
   }else cacheSet(fieldCache,fieldKey,cached,12)
-  return cached
+  return {...cached,seedMs,aggregationMs}
 }
 
 function bilinear(values:Float32Array,width:number,height:number,x:number,y:number){
@@ -75,8 +79,8 @@ export function upsampleActivation(
     for(let y=0;y<height;y++)for(let x=0;x<width;x++)output[y*width+x]=bilinear(values,lowWidth,lowHeight,x*(lowWidth-1)/(width-1||1),y*(lowHeight-1)/(height-1||1))
     return output
   }
-  const guide=makeAnalysisImage(original,Math.max(lowWidth,lowHeight)), features=guide.data, lowRgb=new Float32Array(lowWidth*lowHeight*3)
-  // The feature image has the same sampling grid as activation; use it as the joint bilateral guide.
+  const guide=makeAnalysisImage(original,Math.max(lowWidth,lowHeight),'area'), features=guide.data, lowRgb=new Float32Array(lowWidth*lowHeight*3)
+  // The feature image has the activation grid; its RGB values guide this 2×2 interpolation.
   for(let i=0;i<lowWidth*lowHeight;i++){
     const x=Math.min(guide.width-1,Math.floor(i%lowWidth*guide.width/lowWidth)),y=Math.min(guide.height-1,Math.floor(Math.floor(i/lowWidth)*guide.height/lowHeight)),p=(y*guide.width+x)*4
     lowRgb[i*3]=srgbToLinear(features[p]/255);lowRgb[i*3+1]=srgbToLinear(features[p+1]/255);lowRgb[i*3+2]=srgbToLinear(features[p+2]/255)
@@ -108,38 +112,44 @@ function makeIndependentLayers(layers:CorrectionLayer[]):CorrectionLayer[]{
 }
 export async function runPipeline(
   original:AnalysisImage,fingerprint:string,layers:CorrectionLayer[],pipeline:PipelineConfig,variant:VariantOverride,
-  view:DebugView='corrected',selectedLayerId?:string,selectedConstraintId?:string,
+  view:DebugView='corrected',selectedLayerId?:string,selectedConstraintId?:string,inspectPosition?:{x:number;y:number},
 ):Promise<PipelineOutput>{
   const started=performance.now(),width=original.width,height=original.height,n=width*height
+  let featureExtractionMs=0,activationSeedMs=0,aggregationMs=0,transformSolveMs=0,renderPreparationMs=0
   const architecture=variant.architecture??pipeline.architectureBaseline
   const activeLayers=architecture==='per-point-independent-layer'?makeIndependentLayers(layers):layers
   if(activeLayers.length===0){
     const corrected=new Uint8ClampedArray(original.data),rgba=new Uint8ClampedArray(corrected)
     if(view==='difference'||view==='out-of-gamut')for(let i=0;i<n;i++){const p=i*4;rgba[p]=view==='difference'?0:24;rgba[p+1]=view==='difference'?0:31;rgba[p+2]=view==='difference'?0:29;rgba[p+3]=255}
     else if(view==='dominant'||view==='contribution'||view==='activation'||view==='activation-overlay'||view==='seed'||view==='total-correction')rgba.fill(0),rgba.forEach((_,i)=>{if(i%4===3)rgba[i]=255})
-    return {width,height,rgba,corrected,debug:[],dominant:new Uint8Array(n),outOfGamut:new Uint8Array(n),totalMagnitude:new Float32Array(n),processingMs:performance.now()-started,outOfGamutRate:0,variantId:variant.id}
+     const processingMs=performance.now()-started
+     return {width,height,rgba,corrected,debug:[],dominant:new Uint8Array(n),outOfGamut:new Uint8Array(n),totalMagnitude:new Float32Array(n),processingMs,outOfGamutRate:0,variantId:variant.id,runtime:{featureExtractionMs,activationSeedMs,aggregationMs,transformSolveMs,renderPreparationMs,renderMs:processingMs}}
   }
   const configs=activeLayers.map(layer=>resolveOverrides(layer,variant))
-  const evaluated: {layer:CorrectionLayer; transform:SolvedTransform; activation:Float32Array; seeds:ActivationSeedTexture[];activationConfig:ActivationConfig}[]=[]
+  const evaluated: {layer:CorrectionLayer; transform:SolvedTransform; activation:Float32Array; seeds:ActivationSeedTexture[];activationConfig:ActivationConfig;aggregator:CorrectionLayer['activationAggregator'];features?:FeatureMap}[]=[]
   for(let li=0;li<activeLayers.length;li++){
     const layer=activeLayers[li],cfg=configs[li]
     if(layer.constraints.length===0){
       const transform=weightedRidgeTransform.solve([],cfg.transform)
-      evaluated.push({layer,transform,activation:new Float32Array(n),seeds:[],activationConfig:cfg.activation})
+      evaluated.push({layer,transform,activation:new Float32Array(n),seeds:[],activationConfig:cfg.activation,aggregator:cfg.aggregator})
       continue
     }
-    const analysis=makeAnalysisImage(original,cfg.activation.analysisMaxDimension),featureKey=stable({fingerprint,width:analysis.width,height:analysis.height,radii:cfg.activation.contextRadii})
+    const analysis=makeAnalysisImage(original,cfg.activation.analysisMaxDimension,cfg.activation.downsampling),featureKey=stable({fingerprint,width:analysis.width,height:analysis.height,radii:cfg.activation.contextRadii,downsampling:cfg.activation.downsampling})
     let featurePromise=featureCache.get(featureKey)
     if(!featurePromise){featurePromise=multiscaleFeatureExtractor.analyze(analysis,{contextRadii:cfg.activation.contextRadii});const featureBytes=analysis.width*analysis.height*112;cacheSet(featureCache,featureKey,featurePromise,Math.max(1,Math.min(4,Math.floor(224_000_000/featureBytes))))}
     else cacheSet(featureCache,featureKey,featurePromise,Math.max(1,Math.min(4,Math.floor(224_000_000/(analysis.width*analysis.height*112)))))
-    const features=await featurePromise
-    const cache=await preparedActivation(analysis,fingerprint,layer,cfg.activation,cfg.aggregator,features)
+     const featureStarted=performance.now(),features=await featurePromise
+     featureExtractionMs+=performance.now()-featureStarted
+     const cache=await preparedActivation(analysis,fingerprint,layer,cfg.activation,cfg.aggregator,features)
+     activationSeedMs+=cache.seedMs;aggregationMs+=cache.aggregationMs
     const upKey=stable({key:cache.key,width,height,upsampling:cfg.activation.upsampling,sigma:cfg.activation.upsampleSigma})
-    let activation=upsampleCache.get(upKey)
+     const upsampleStarted=performance.now();let activation=upsampleCache.get(upKey)
     if(!activation){activation=upsampleActivation(cache.field,cache.width,cache.height,original,cfg.activation.upsampling,cfg.activation.upsampleSigma);cacheSet(upsampleCache,upKey,activation,maxFieldCacheEntries(n))}
-    else cacheSet(upsampleCache,upKey,activation,maxFieldCacheEntries(n))
-    const transform=weightedRidgeTransform.solve(layer.constraints,cfg.transform)
-    evaluated.push({layer,transform,activation,seeds:cache.seeds,activationConfig:cfg.activation})
+     else cacheSet(upsampleCache,upKey,activation,maxFieldCacheEntries(n))
+     renderPreparationMs+=performance.now()-upsampleStarted
+     const transformStarted=performance.now(),transform=weightedRidgeTransform.solve(layer.constraints,cfg.transform)
+     transformSolveMs+=performance.now()-transformStarted
+    evaluated.push({layer,transform,activation,seeds:cache.seeds,activationConfig:cfg.activation,aggregator:cfg.aggregator,features})
   }
   if(architecture==='joint-per-pixel-regression'){
     const jointEvidence=evaluated.flatMap(item=>item.layer.constraints.map(constraint=>{
@@ -166,9 +176,10 @@ export async function runPipeline(
       const mapped=(variant.gamut??pipeline.gamut)==='hard-clip'?hardClipGamut.map(raw):oklchChromaCompression.map(raw),encoded=linearToEncodedRgb(mapped)
       corrected[p]=Math.round(encoded[0]*255);corrected[p+1]=Math.round(encoded[1]*255);corrected[p+2]=Math.round(encoded[2]*255);corrected[p+3]=original.data[p+3]
     }
-    const debug=evaluated.map((item,index)=>({id:item.layer.id,activation:item.activation,seeds:item.seeds,contribution:contributions[index],transform:item.transform}))
+    const debug=evaluated.map((item,index)=>makeLayerDebug(item,contributions[index],selectedConstraintId,needsActivationBreakdown(view)))
     const rgba=view==='corrected'?new Uint8ClampedArray(corrected):debugViewPixels(view,original,corrected,debug,dominant,outOfGamut,totalMagnitude,selectedLayerId,selectedConstraintId)
-    return {width,height,rgba,corrected,debug,dominant,outOfGamut,totalMagnitude,processingMs:performance.now()-started,outOfGamutRate:n?outCount/n:0,variantId:variant.id}
+     const processingMs=performance.now()-started
+     return {width,height,rgba,corrected,debug,dominant,outOfGamut,totalMagnitude,processingMs,outOfGamutRate:n?outCount/n:0,variantId:variant.id,runtime:{featureExtractionMs,activationSeedMs,aggregationMs,transformSolveMs,renderPreparationMs,renderMs:Math.max(0,processingMs-featureExtractionMs-activationSeedMs-aggregationMs-transformSolveMs-renderPreparationMs)},featureInspection:makeFeatureInspection(evaluated,original,inspectPosition,selectedConstraintId)}
   }
   const compositorConfig={mode:variant.compositor??pipeline.compositor,gamut:variant.gamut??pipeline.gamut}
   const compositor=getCompositor(compositorConfig.mode),corrected=new Uint8ClampedArray(n*4),dominant=new Uint8Array(n),outOfGamut=new Uint8Array(n),totalMagnitude=new Float32Array(n)
@@ -189,10 +200,28 @@ export async function runPipeline(
     if(gamutInvalid){outOfGamut[i]=1;outCount++}
     const encoded=linearToEncodedRgb(mapped);corrected[p]=Math.round(encoded[0]*255);corrected[p+1]=Math.round(encoded[1]*255);corrected[p+2]=Math.round(encoded[2]*255);corrected[p+3]=original.data[p+3]
   }
-  const debug=evaluated.map((item,index)=>({id:item.layer.id,activation:item.activation,seeds:item.seeds,contribution:contributions[index],transform:item.transform}))
+  const debug=evaluated.map((item,index)=>makeLayerDebug(item,contributions[index],selectedConstraintId,needsActivationBreakdown(view)))
   let rgba=new Uint8ClampedArray(corrected)
   if(view!=='corrected') rgba=debugViewPixels(view,original,corrected,debug,dominant,outOfGamut,totalMagnitude,selectedLayerId,selectedConstraintId)
-  return {width,height,rgba,corrected,debug,dominant,outOfGamut,totalMagnitude,processingMs:performance.now()-started,outOfGamutRate:n?outCount/n:0,variantId:variant.id}
+  const processingMs=performance.now()-started
+  return {width,height,rgba,corrected,debug,dominant,outOfGamut,totalMagnitude,processingMs,outOfGamutRate:n?outCount/n:0,variantId:variant.id,runtime:{featureExtractionMs,activationSeedMs,aggregationMs,transformSolveMs,renderPreparationMs,renderMs:Math.max(0,processingMs-featureExtractionMs-activationSeedMs-aggregationMs-transformSolveMs-renderPreparationMs)},featureInspection:makeFeatureInspection(evaluated,original,inspectPosition,selectedConstraintId)}
+}
+function needsActivationBreakdown(view:DebugView){return view.startsWith('distance-')||view==='dominant-seed'||view==='hint-contribution'}
+function makeFeatureInspection(evaluated:{layer:CorrectionLayer;activationConfig:ActivationConfig;features?:FeatureMap}[],original:AnalysisImage,position:{x:number;y:number}|undefined,constraintId?:string):PipelineOutput['featureInspection']{
+  if(!position)return undefined
+  const item=evaluated.find(value=>value.layer.constraints.some(c=>c.id===constraintId))??evaluated.find(value=>value.features&&value.layer.constraints.length)
+  if(!item?.features)return undefined
+  const constraint=item.layer.constraints.find(c=>c.id===constraintId)??item.layer.constraints[0],x=Math.min(1,Math.max(0,position.x)),y=Math.min(1,Math.max(0,position.y)),query=featureAt(item.features,x,y),seed=featureForConstraint(item.features,constraint.position,constraint.source),p=(Math.round(y*(original.height-1))*original.width+Math.round(x*(original.width-1)))*4,rgb={r:srgbToLinear(original.data[p]/255),g:srgbToLinear(original.data[p+1]/255),b:srgbToLinear(original.data[p+2]/255)}
+  return {position:{x,y},rgb,query,seed,breakdown:evaluateAppearanceGaussian(query,seed,item.activationConfig)}
+}
+function makeLayerDebug(item:{layer:CorrectionLayer;transform:SolvedTransform;activation:Float32Array;seeds:ActivationSeedTexture[];activationConfig:ActivationConfig;aggregator:CorrectionLayer['activationAggregator'];features?:FeatureMap},contribution:Float32Array,selectedConstraintId?:string,includeBreakdown=false):LayerDebug{
+  const features=item.features,constraint=item.layer.constraints.find(c=>c.id===selectedConstraintId)??item.layer.constraints[0]
+  if(!features||!constraint||!includeBreakdown)return {id:item.layer.id,activation:item.activation,seeds:item.seeds,contribution,transform:item.transform}
+  const seed=featureForConstraint(features,constraint.position,constraint.source),breakdown=new Array<ActivationBreakdown>(features.width*features.height)
+  for(let y=0;y<features.height;y++)for(let x=0;x<features.width;x++)breakdown[y*features.width+x]=evaluateAppearanceGaussian(featureAt(features,x/(features.width-1||1),y/(features.height-1||1)),seed,item.activationConfig)
+  const dominantSeed=new Uint8Array(features.width*features.height),noHint=aggregateActivationFields(item.seeds,[],item.activationConfig,item.aggregator),hintContribution=new Float32Array(dominantSeed.length)
+  for(let i=0;i<dominantSeed.length;i++){let best=-1,maximum=-1;for(let k=0;k<item.seeds.length;k++)if(item.seeds[k].values[i]>maximum){maximum=item.seeds[k].values[i];best=k}dominantSeed[i]=best<0?255:best;hintContribution[i]=item.activation[i]-noHint[i]}
+  return {id:item.layer.id,activation:item.activation,seeds:item.seeds,contribution,transform:item.transform,breakdown,breakdownWidth:features.width,breakdownHeight:features.height,dominantSeed,hintContribution}
 }
 function heat(v:number):[number,number,number]{const t=clamp01(v);return [Math.round(255*Math.min(1,Math.max(0,1.6*t))),Math.round(255*Math.max(0,1-Math.abs(t*2-1))),Math.round(255*Math.max(0,1-1.6*t))]}
 function debugViewPixels(view:DebugView,original:AnalysisImage,corrected:Uint8ClampedArray,debug:LayerDebug[],dominant:Uint8Array,out:Uint8Array,total:Float32Array,layerId?:string,constraintId?:string){
@@ -211,6 +240,12 @@ function debugViewPixels(view:DebugView,original:AnalysisImage,corrected:Uint8Cl
       let value=0
       if(lowSeed){const x=i%original.width,y=Math.floor(i/original.width),sx=Math.round(x*(lowSeed.width-1)/(original.width-1||1)),sy=Math.round(y*(lowSeed.height-1)/(original.height-1||1));value=lowSeed.values[sy*lowSeed.width+sx]}
       const [r,g,b]=heat(value);rgb=[r,g,b]
+    }
+    else if(view==='dominant-seed'){const fw=selected?.breakdownWidth??0,fh=selected?.breakdownHeight??0,sx=Math.round((i%original.width)*(fw-1)/(original.width-1||1)),sy=Math.round(Math.floor(i/original.width)*(fh-1)/(original.height-1||1)),idx=selected?.dominantSeed?.[sy*fw+sx]??255;rgb=idx===255?[22,28,24]:[Math.round(70+idx*61%170),Math.round(75+idx*107%160),Math.round(80+idx*139%150)]}
+    else if(view==='hint-contribution'){const fw=selected?.breakdownWidth??0,fh=selected?.breakdownHeight??0,sx=Math.round((i%original.width)*(fw-1)/(original.width-1||1)),sy=Math.round(Math.floor(i/original.width)*(fh-1)/(original.height-1||1)),value=selected?.hintContribution?.[sy*fw+sx]??0,magnitude=Math.min(1,Math.abs(value)*2);rgb=value>=0?[Math.round(40+40*magnitude),Math.round(70+170*magnitude),Math.round(90+140*magnitude)]:[Math.round(110+140*magnitude),Math.round(65+50*magnitude),Math.round(120+120*magnitude)]}
+    else if(view.startsWith('distance-')){
+      const field=selected?.breakdown,fw=selected?.breakdownWidth??0,fh=selected?.breakdownHeight??0,sx=Math.round((i%original.width)*(fw-1)/(original.width-1||1)),sy=Math.round(Math.floor(i/original.width)*(fh-1)/(original.height-1||1)),entry=field?.[sy*fw+sx]
+      const key=view==='distance-color'?'colorDistance':view==='distance-spatial'?'spatialDistance':view==='distance-context'?'contextDistance':view==='distance-edge'?'edgeDistance':'totalDistance',value=entry?.[key]??0,[r,g,b]=heat(1-Math.exp(-Math.max(0,value)*.25));rgb=[r,g,b]
     }
     else if(view==='dominant'){const idx=dominant[i];if(idx===255)rgb=[25,31,26];else{const h=(idx*0.61803398875)%1,t=h*6,f=t-Math.floor(t),q=1-f;const colors=[[1,f,0],[q,1,0],[0,1,f],[0,q,1],[f,0,1],[1,0,q]][Math.floor(t)%6];rgb=colors.map(v=>Math.round(v*190+30)) as [number,number,number]}}
     else if(view==='contribution'){const [r,g,b]=heat(selected?.contribution[i]??0);rgb=[r,g,b]}

@@ -37,10 +37,10 @@ pnpm preview
 
 - encoded sRGB → linear sRGB 工作空间；Activation、色彩预览和 ΔE 使用 OKLab。
 - 在默认 max dimension 512（可选 256/1024）提取 OKLab、normalized XY、三尺度均值/方差、local contrast、亮度/色度梯度及 edge/texture 特征。
-- 每个 constraint 单独计算 Gaussian Activation Seed；公式不读取 target。Layer 聚合默认 probabilistic OR，也支持 smooth max 与空间 include/exclude hints。
+- 当前 Activation 是 **AppearanceGaussianActivation** 外观/特征相似度高斯基线：颜色、XY、context、edge 加权距离后应用 Gaussian kernel。它不直接推断真实光照或 transform regime；后者仍是研究目标。每个 constraint 单独计算 target-independent Seed；Layer 聚合默认 probabilistic OR，也支持 smooth max 与空间 include/exclude hints。
 - 每个 Layer 独立求一个 shared residual transform：constant、affine、centered second-order root-polynomial 或根据 spread / conditioning 自适应容量；weighted ridge 使用 Cholesky 求解。
 - 默认 residual-add 在相同 input 上求所有 Layer residual，因而与图层顺序无关。还提供 sequential、normalized-mixture 和 hard-clip gamut 对照。
-- Activation Field 低分辨率生成，再使用 bilinear 或 joint-bilateral upsampling；最终以 OKLCH chroma compression 映射到 sRGB gamut。
+- 默认使用 area/box downsampling 构建低分辨率分析图；nearest、bilinear 与 area 可对比。Activation Field 上采样支持 bilinear 及当前仅使用 2×2 邻域的 **guided bilinear interpolation**（不是完整 joint-bilateral filter）。最终以 OKLCH chroma compression 映射到 sRGB gamut；正常流程在色域映射前保留有限的 out-of-gamut linear RGB。
 
 完整模块边界、公式、Pipeline 参数及当前实验假设见：
 

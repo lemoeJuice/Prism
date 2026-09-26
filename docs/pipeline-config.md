@@ -23,9 +23,10 @@ All algorithm values live in serializable configuration objects (`src/core/types
 | `edgeScale` | 0.45 | Edge-statistic distance scale. |
 | `sharpness` | 1.0 | Exponential distance multiplier. |
 | `analysisMaxDimension` | 512 | Feature/seed grid cap; choices are 256, 512, 1024. |
+| `downsampling` | `area` | Analysis image resize: nearest baseline, bilinear, or true area/box overlap sampling. |
 | `contextRadii` | `[3,12,32]` | Small, medium and large box-statistic radii at the 512 scale. |
-| `upsampling` | `joint-bilateral` | Bilinear or edge-aware field reconstruction. |
-| `upsampleSigma` | 0.09 | RGB range bandwidth for joint bilateral upsampling. |
+| `upsampling` | `guided-bilinear` | Bilinear or current color-guided 2×2 interpolation; this is not full joint-bilateral filtering. |
+| `upsampleSigma` | 0.09 | RGB range bandwidth for color-guided bilinear interpolation. |
 | `hintRadius` | 0.11 | Default normalized radius for newly added hints. |
 | `hintSharpness` | 1.0 | Gaussian falloff multiplier for spatial hints. |
 

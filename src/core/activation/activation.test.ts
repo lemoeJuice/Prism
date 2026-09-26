@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { aggregateActivationFields, computeSeedField, normalizeActivationConfig, probabilisticOrAggregator, smoothMaxAggregator } from './index'
-import { extractFeatures } from '../features'
+import { aggregateActivationFields, computeSeedField, evaluateAppearanceGaussian, normalizeActivationConfig, probabilisticOrAggregator, smoothMaxAggregator } from './index'
+import { extractFeatures, featureAt, featureForConstraint } from '../features'
 import { DEFAULT_ACTIVATION, DEFAULT_AGGREGATOR } from '../types'
 import type { ColorConstraint } from '../types'
 
@@ -44,5 +44,11 @@ describe('target-independent activation',()=>{
     expect([config.colorWeight,config.colorScale,config.sharpness,...config.contextRadii].every(Number.isFinite)).toBe(true)
     expect(config.colorWeight).toBeLessThanOrEqual(20)
     expect(config.colorScale).toBeGreaterThan(0)
+  })
+  it('reports independently inspectable distance components consistent with seed activation',async()=>{
+    const map=await extractFeatures(image(),[2,4,8]),config={...DEFAULT_ACTIVATION,preset:'color+context+edge' as const},seed={...c({r:.7,g:.2,b:.1}),position:{x:.2,y:.5}},a=computeSeedField(map,seed,config),qx=Math.round(.8*(map.width-1))/(map.width-1),qy=Math.round(.5*(map.height-1))/(map.height-1),query=evaluateAppearanceGaussian(featureAt(map,qx,qy),featureForConstraint(map,seed.position,seed.source),config)
+    expect(query.totalDistance).toBeCloseTo(query.weightedColor+query.weightedSpatial+query.weightedContext+query.weightedEdge,8)
+    expect(query.activation).toBeGreaterThanOrEqual(0);expect(query.activation).toBeLessThanOrEqual(1)
+    const index=Math.floor(map.height/2)*map.width+Math.round(.8*(map.width-1));expect(query.activation).toBeCloseTo(a.values[index],5)
   })
 })

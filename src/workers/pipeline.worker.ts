@@ -1,15 +1,17 @@
-import { runPipeline, type DebugView, type VariantOverride } from '../core/pipeline'
+import { runPipeline, type DebugView, type VariantOverride, type PipelineOutput } from '../core/pipeline'
 import { clearPipelineCaches } from '../core/pipeline'
 import { fingerprintImage } from '../core/project'
 import type { CorrectionLayer, PipelineConfig } from '../core/types'
+import { runSyntheticBenchmarks } from '../experiments/fixtures/benchmark'
 const workerScope=self as unknown as DedicatedWorkerGlobalScope
 
 interface SetImageMessage { type:'set-image'; width:number;height:number;data:ArrayBuffer;name:string;fingerprint?:string }
 interface RenderMessage {
   type:'render';requestId:number;layers:CorrectionLayer[];pipeline:PipelineConfig;variants:VariantOverride[]
-  view:DebugView;selectedLayerId?:string;selectedConstraintId?:string
+  view:DebugView;selectedLayerId?:string;selectedConstraintId?:string;inspectPosition?:{x:number;y:number}
 }
-type WorkerMessage=SetImageMessage|RenderMessage
+interface BenchmarkMessage {type:'synthetic-benchmark'}
+type WorkerMessage=SetImageMessage|RenderMessage|BenchmarkMessage
 let original:{width:number;height:number;data:Uint8ClampedArray;name:string;fingerprint:string}|undefined
 
 workerScope.onmessage=async(event:MessageEvent<WorkerMessage>)=>{
@@ -21,20 +23,25 @@ workerScope.onmessage=async(event:MessageEvent<WorkerMessage>)=>{
     workerScope.postMessage({type:'image-ready',width:message.width,height:message.height,fingerprint})
     return
   }
+  if(message.type==='synthetic-benchmark'){
+    try{const rows=await runSyntheticBenchmarks();workerScope.postMessage({type:'synthetic-benchmark-results',rows})}
+    catch(error){workerScope.postMessage({type:'synthetic-benchmark-error',message:error instanceof Error?error.message:String(error)})}
+    return
+  }
   if(!original){workerScope.postMessage({type:'error',requestId:message.requestId,message:'Load a photo before rendering.'});return}
   try {
     const input=original
     const variants=message.variants.length?message.variants:[{id:'default',name:'Shared correction'}]
-    const results=[] as {id:string;name:string;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;processingMs:number;outOfGamutRate:number;thumbnails:{id:string;rgba:Uint8Array}[];diagnostics:{id:string;effectiveMode:string;condition:number;stable:boolean;residualMagnitude:number;colorSpread:number;constraintCount:number;coefficients:number[][]}[]}[]
+    const results=[] as {id:string;name:string;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;processingMs:number;runtime:PipelineOutput['runtime'];outOfGamutRate:number;thumbnails:{id:string;rgba:Uint8Array}[];diagnostics:{id:string;effectiveMode:string;condition:number;stable:boolean;residualMagnitude:number;colorSpread:number;constraintCount:number;coefficients:number[][];fallbackReason?:string;coefficientClipped:boolean;numericFallbackCount:number}[];featureInspection?:PipelineOutput['featureInspection']}[]
     for(let i=0;i<variants.length;i++){
       const variant=variants[i]
-      const output=await runPipeline(input,input.fingerprint,message.layers,message.pipeline,variant,i===0?message.view:'corrected',message.selectedLayerId,message.selectedConstraintId)
+      const output=await runPipeline(input,input.fingerprint,message.layers,message.pipeline,variant,i===0?message.view:'corrected',message.selectedLayerId,message.selectedConstraintId,i===0?message.inspectPosition:undefined)
       const thumbnails=output.debug.flatMap(layer=>[
         {id:layer.id,rgba:makeActivationThumbnail(layer.activation,input.data,input.width,input.height)},
         ...layer.seeds.map(seed=>({id:`${layer.id}:seed:${seed.constraintId}`,rgba:makeThumbnail(seed.values,seed.width,seed.height,48,48)})),
       ])
-      const diagnostics=output.debug.map(layer=>({id:layer.id,effectiveMode:layer.transform.effectiveMode,condition:layer.transform.condition,stable:layer.transform.stable,residualMagnitude:layer.transform.residualMagnitude,colorSpread:layer.transform.colorSpread,constraintCount:layer.transform.constraintCount,coefficients:layer.transform.coefficients}))
-      results.push({id:variant.id,name:variant.name,rgba:output.rgba,corrected:output.corrected,processingMs:output.processingMs,outOfGamutRate:output.outOfGamutRate,thumbnails,diagnostics})
+     const diagnostics=output.debug.map(layer=>({id:layer.id,effectiveMode:layer.transform.effectiveMode,condition:layer.transform.condition,stable:layer.transform.stable,residualMagnitude:layer.transform.residualMagnitude,colorSpread:layer.transform.colorSpread,constraintCount:layer.transform.constraintCount,coefficients:layer.transform.coefficients,fallbackReason:layer.transform.fallbackReason,coefficientClipped:layer.transform.coefficientClipped,numericFallbackCount:layer.transform.numericFallbackCount}))
+      results.push({id:variant.id,name:variant.name,rgba:output.rgba,corrected:output.corrected,processingMs:output.processingMs,runtime:output.runtime,outOfGamutRate:output.outOfGamutRate,thumbnails,diagnostics,featureInspection:output.featureInspection})
     }
     const transfers:Transferable[]=[]
     for(const result of results){transfers.push(result.rgba.buffer,result.corrected.buffer);for(const thumb of result.thumbnails)transfers.push(thumb.rgba.buffer)}

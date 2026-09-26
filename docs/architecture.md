@@ -9,8 +9,8 @@ The primary user object is a `CorrectionLayer`, not an isolated color point. A l
 ## Modules
 
 - `core/color`: sRGB transfer functions, linear-sRGB/OKLab/OKLCH conversion, ΔEOK and gamut mapper.
-- `core/features`: analysis-image scaling and original-only multiscale feature extraction.
-- `core/activation`: target-independent Gaussian model, seed fields, probabilistic-OR/smooth-max aggregation, spatial hint propagation.
+- `core/features`: configurable nearest / bilinear / area-box analysis-image scaling and original-only multiscale feature extraction.
+- `core/activation`: target-independent AppearanceGaussianActivation baseline, per-pixel distance breakdown, seed fields, probabilistic-OR/smooth-max aggregation, spatial hint propagation.
 - `core/transform`: evidence-adaptive basis choice, weighted ridge and Cholesky solver.
 - `core/compositor`: residual-add, sequential and normalized-mixture strategies.
 - `core/pipeline`: cache keys, low-to-full field upsampling, variant evaluation, debug views and diagnostics.
@@ -23,18 +23,18 @@ The primary user object is a `CorrectionLayer`, not an isolated color point. A l
 
 ```text
 original encoded sRGB
-  → analysis image (max dimension 256 / 512 / 1024)
+  → analysis image (area/box by default; nearest / bilinear / area; max dimension 256 / 512 / 1024)
   → OKLab + XY + multiscale context / edge features
   → per-constraint Activation Seeds (target independent)
   → Layer aggregation + optional include/exclude hints
   → one weighted-ridge shared Transform per Layer
-  → low-resolution activation upsample (bilinear / joint bilateral)
+  → low-resolution activation upsample (bilinear / guided bilinear over a 2×2 neighborhood)
   → full-resolution layer composition
   → gamut mapping
   → WebGL2 preview / PNG export
 ```
 
-Seed cache keys include image fingerprint, analysis configuration, constraint ID, original position/source and confidence; they deliberately exclude target. Aggregate cache keys additionally include hints and aggregator settings. Transform solves are performed per pipeline evaluation and never read position or activation. Consequently a target edit hits the same seed, aggregate and upsampled-field caches while changing transform output. A position/source/config change invalidates activation. Transient caches are bounded and cleared when the image fingerprint changes. No feature maps, fields, solved transforms or GPU resources enter saved projects.
+Seed cache keys include image fingerprint, analysis configuration (including downsampling), constraint ID, original position/source and confidence; they deliberately exclude target. Aggregate cache keys additionally include hints and aggregator settings. Transform solves are performed per pipeline evaluation and never read position or activation. Consequently a target edit hits the same seed, aggregate and upsampled-field caches while changing transform output. A position/source/config change invalidates activation. Transform configuration is absent from activation cache keys. Transient caches are bounded and cleared when the image fingerprint changes. No feature maps, fields, solved transforms or GPU resources enter saved projects.
 
 ## Worker and renderer
 
@@ -46,4 +46,4 @@ The main thread decodes the selected photo and retains original pixels only for 
 
 ## Baseline hooks
 
-The active architecture is `shared-correction-layer`. Compare Mode includes a simplified working per-point-independent approximation and a seed-weighted local constant-residual joint-per-pixel baseline. The latter is a baseline hook, not a full local affine regression or a reproduction of a published method. Strategy boundaries allow replacing Activation, Transform, Aggregator, Compositor, gamut mapping or architecture policy independently.
+The active architecture is `shared-correction-layer`. Compare Mode includes a simplified working per-point-independent approximation and a seed-weighted local constant-residual joint-per-pixel baseline. The latter is a baseline hook, not a full local affine regression or a reproduction of a published method. Current AppearanceGaussianActivation is an appearance-feature similarity baseline, not a transform-regime estimator. Strategy boundaries allow replacing Activation, Transform, Aggregator, Compositor, gamut mapping or architecture policy independently.

@@ -20,7 +20,7 @@ export interface TransformModifierConfig { type: string; value?: number }
 
 export type ActivationPreset = 'spatial-only' | 'color-only' | 'color+xy' | 'color+context' | 'color+context+edge' | 'custom'
 export interface ActivationConfig {
-  model: 'gaussian'
+  model: 'appearance-gaussian'
   preset: ActivationPreset
   colorWeight: number
   spatialWeight: number
@@ -40,8 +40,9 @@ export interface ActivationConfig {
   edgeScale: number
   sharpness: number
   analysisMaxDimension: 256 | 512 | 1024
+  downsampling: 'nearest' | 'bilinear' | 'area'
   contextRadii: [number, number, number]
-  upsampling: 'bilinear' | 'joint-bilateral'
+  upsampling: 'bilinear' | 'guided-bilinear'
   upsampleSigma: number
   hintRadius: number
   hintSharpness: number
@@ -93,12 +94,12 @@ export interface Project {
 export interface ActivationHintSample { type: 'include' | 'exclude'; influence: number }
 
 export const DEFAULT_ACTIVATION: ActivationConfig = {
-  model: 'gaussian', preset: 'color+context+edge', colorWeight: 1.15, spatialWeight: 0.75,
+  model: 'appearance-gaussian', preset: 'color+context+edge', colorWeight: 1.15, spatialWeight: 0.75,
   contextWeight: 0.85, edgeWeight: 0.35, spatialScale: 0.32, colorScale: 0.24,
   contextScale: 0.38, edgeScale: 0.45, sharpness: 1, analysisMaxDimension: 512,
   contextSmallWeight:1,contextMediumWeight:0.72,contextLargeWeight:0.48,contextVarianceWeight:0.12,
   localContrastWeight:0.18,edgeTextureWeight:1,luminanceGradientWeight:0.2,chromaGradientWeight:0.2,
-  contextRadii: [3, 12, 32], upsampling: 'joint-bilateral', upsampleSigma: 0.09, hintRadius: 0.11,hintSharpness:1,
+  contextRadii: [3, 12, 32], downsampling:'area', upsampling: 'guided-bilinear', upsampleSigma: 0.09, hintRadius: 0.11,hintSharpness:1,
 }
 export const DEFAULT_AGGREGATOR: ActivationAggregatorConfig = { type: 'probabilistic-or', temperature: 0.12 }
 export const DEFAULT_TRANSFORM: TransformConfig = {

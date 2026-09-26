@@ -13,6 +13,9 @@ export interface SolvedTransform {
   residualMagnitude: number
   constraintCount: number
   colorSpread: number
+  fallbackReason?:string
+  coefficientClipped:boolean
+  numericFallbackCount:number
 }
 export interface TransformModel { solve(constraints: readonly ColorConstraint[], config: TransformConfig): SolvedTransform }
 export interface TransformModifier { apply(base: SolvedTransform): SolvedTransform }
@@ -30,14 +33,15 @@ export function normalizeTransformConfig(input:TransformConfig):TransformConfig 
   }
 }
 
-function basis(color: LinearRGB, mode: Exclude<TransformMode,'adaptive'>, center: LinearRGB): number[] {
+export function transformBasis(color: LinearRGB, mode: Exclude<TransformMode,'adaptive'>, center: LinearRGB): number[] {
   if(mode==='constant') return [1]
   if(mode==='affine') return [1,color.r,color.g,color.b]
   return [1,color.r-center.r,color.g-center.g,color.b-center.b,
-    Math.sqrt(Math.max(0,color.r*color.g))-Math.sqrt(Math.max(0,center.r*center.g)),
-    Math.sqrt(Math.max(0,color.r*color.b))-Math.sqrt(Math.max(0,center.r*center.b)),
-    Math.sqrt(Math.max(0,color.g*color.b))-Math.sqrt(Math.max(0,center.g*center.b))]
+    signedRootProduct(color.r,color.g)-signedRootProduct(center.r,center.g),
+    signedRootProduct(color.r,color.b)-signedRootProduct(center.r,center.b),
+    signedRootProduct(color.g,color.b)-signedRootProduct(center.g,center.b)]
 }
+function signedRootProduct(a:number,b:number){return (a===0||b===0?0:Math.sign(a)*Math.sign(b))*Math.sqrt(Math.abs(a))*Math.sqrt(Math.abs(b))}
 function sourceCenter(constraints: readonly ColorConstraint[]): LinearRGB {
   let weight=0,r=0,g=0,b=0
   for(const c of constraints){const w=Math.max(0,c.confidence);weight+=w;r+=c.source.r*w;g+=c.source.g*w;b+=c.source.b*w}
@@ -56,7 +60,7 @@ function sortedConstraints(constraints: readonly ColorConstraint[]) {
 }
 function gramFor(constraints: readonly ColorConstraint[], mode: Exclude<TransformMode,'adaptive'>, center: LinearRGB) {
   const size=mode==='constant'?1:mode==='affine'?4:7, gram=Array.from({length:size},()=>new Array<number>(size).fill(0))
-  for(const c of constraints){const x=basis(c.source,mode,center),w=Math.max(0,c.confidence);for(let r=0;r<size;r++)for(let col=0;col<size;col++)gram[r][col]+=w*x[r]*x[col]}
+  for(const c of constraints){const x=transformBasis(c.source,mode,center),w=Math.max(0,c.confidence);for(let r=0;r<size;r++)for(let col=0;col<size;col++)gram[r][col]+=w*x[r]*x[col]}
   return gram
 }
 function conditionEstimate(matrix: number[][]): number {
@@ -92,35 +96,59 @@ export const weightedRidgeTransform: TransformModel = {
     const config=normalizeTransformConfig(constraintsInput)
     const constraints=sortedConstraints(input.filter(c=>[c.source.r,c.source.g,c.source.b,c.target.r,c.target.g,c.target.b,c.confidence].every(Number.isFinite)).map(c=>({...c,confidence:Math.max(0,Math.min(1,c.confidence))})))
     const center=sourceCenter(constraints), spread=colorSpread(constraints), count=constraints.filter(c=>c.confidence>1e-6).length
-    if(constraints.length===0) return {apply:c=>({...c}),mode:config.mode,effectiveMode:'constant',coefficients:[[0],[0],[0]],condition:1,stable:true,regularization:0,residualMagnitude:0,constraintCount:0,colorSpread:0}
+    if(constraints.length===0) return {apply:c=>({...c}),mode:config.mode,effectiveMode:'constant',coefficients:[[0],[0],[0]],condition:1,stable:true,regularization:0,residualMagnitude:0,constraintCount:0,colorSpread:0,coefficientClipped:false,numericFallbackCount:0}
     let selected: Exclude<TransformMode,'adaptive'> = config.mode==='adaptive'?'constant':config.mode
+    let fallbackReason:string|undefined
     let adaptiveReg=config.regularization
     const affineCondition=conditionEstimate(gramFor(constraints,'affine',center))
     if(config.mode==='adaptive') {
       if(count>1 && spread>config.adaptiveMinSpread*config.adaptiveAffineSpreadFraction && affineCondition<config.adaptiveAffineConditionLimit) selected='affine'
+      else if(count>1)fallbackReason='insufficient-independent-color-spread-or-affine-conditioning'
       if(count>=config.adaptiveMinConstraints && spread>config.adaptiveMinSpread && affineCondition<config.adaptiveRootConditionLimit) selected='root-polynomial'
       const conditionBoost=Math.min(config.adaptiveMaxRegularizationBoost,Math.log10(Math.max(1,affineCondition))/Math.max(0.1,config.adaptiveConditionBoost))
       adaptiveReg *= 1 + conditionBoost / (1+Math.sqrt(spread))
     }
     let gram=gramFor(constraints,selected,center), condition=conditionEstimate(gram)
     if(config.mode==='adaptive' && selected==='root-polynomial' && (condition>config.adaptiveRootConditionLimit || count<selectedFeatureCount(selected))) {
-      selected='affine';gram=gramFor(constraints,selected,center);condition=conditionEstimate(gram)
+      selected='affine';fallbackReason='root-polynomial-conditioning-or-evidence';gram=gramFor(constraints,selected,center);condition=conditionEstimate(gram)
     }
     const size=gram.length, regularization=Math.max(1e-8,adaptiveReg), nonlinear=selected==='root-polynomial'?Math.max(regularization,config.nonlinearRegularization*(1+Math.min(config.nonlinearMaxConditionBoost,condition/Math.max(1,config.nonlinearConditionScale)))):regularization
     const system=gram.map(row=>row.slice())
     for(let i=0;i<size;i++)system[i][i]+= i===0?regularization*config.interceptRegularizationWeight:(selected==='root-polynomial'&&i>=4?nonlinear:regularization)
     const rhs=[new Array<number>(size).fill(0),new Array<number>(size).fill(0),new Array<number>(size).fill(0)]
-    for(const c of constraints){const f=basis(c.source,selected,center),w=Math.max(0,c.confidence),d=[c.target.r-c.source.r,c.target.g-c.source.g,c.target.b-c.source.b];for(let ch=0;ch<3;ch++)for(let i=0;i<size;i++)rhs[ch][i]+=w*f[i]*d[ch]}
-    const coefficients=rhs.map(values=>choleskySolve(system,values) ?? new Array<number>(size).fill(0))
-    const limit=config.coefficientLimit
-    for(const row of coefficients)for(let i=0;i<row.length;i++)row[i]=Number.isFinite(row[i])?Math.max(-limit,Math.min(limit,row[i])):0
-    const residualMagnitude=Math.sqrt(coefficients.reduce((sum,row)=>sum+row.reduce((s,v)=>s+v*v,0),0))
-    const apply=(color:LinearRGB):LinearRGB=>{
-      const f=basis(color,selected,center), delta=[0,1,2].map(ch=>coefficients[ch].reduce((sum,value,i)=>sum+value*f[i],0))
-      return {r:finiteBound(color.r+delta[0]),g:finiteBound(color.g+delta[1]),b:finiteBound(color.b+delta[2])}
+    for(const c of constraints){const f=transformBasis(c.source,selected,center),w=Math.max(0,c.confidence),d=[c.target.r-c.source.r,c.target.g-c.source.g,c.target.b-c.source.b];for(let ch=0;ch<3;ch++)for(let i=0;i<size;i++)rhs[ch][i]+=w*f[i]*d[ch]}
+    let coefficients:(number[]|null)[]=rhs.map(values=>choleskySolve(system,values))
+    if(coefficients.some(row=>row===null)){
+      fallbackReason='cholesky-failure'
+      if(config.mode==='adaptive'&&selected==='root-polynomial'){selected='affine';gram=gramFor(constraints,selected,center);condition=conditionEstimate(gram);return solveMode(constraints,config,center,selected,fallbackReason,condition)}
+      if(config.mode==='adaptive'&&selected==='affine'){selected='constant';condition=conditionEstimate(gramFor(constraints,'constant',center));return solveMode(constraints,config,center,selected,fallbackReason,condition)}
+      coefficients=rhs.map(()=>null)
     }
-    return {apply,mode:config.mode,effectiveMode:selected,coefficients,condition,stable:Number.isFinite(condition)&&condition<1e10,regularization:nonlinear,residualMagnitude,constraintCount:constraints.length,colorSpread:spread}
+    const solvedCoefficients:number[][]=coefficients.map(row=>row??new Array<number>(size).fill(0))
+    const limit=config.coefficientLimit,coefficientClipped=solvedCoefficients.some(row=>row.some(value=>!Number.isFinite(value)||Math.abs(value)>limit))
+    if(config.mode==='adaptive'&&coefficientClipped){
+      if(selected==='root-polynomial')return solveMode(constraints,config,center,'affine','coefficient-safety-bound-applied',affineCondition)
+      if(selected==='affine')return solveMode(constraints,config,center,'constant','coefficient-safety-bound-applied',conditionEstimate(gramFor(constraints,'constant',center)))
+      return {apply:color=>({...color}),mode:config.mode,effectiveMode:'constant',coefficients:[[0],[0],[0]],condition,stable:false,regularization:regularization,residualMagnitude:0,constraintCount:constraints.length,colorSpread:spread,coefficientClipped:true,numericFallbackCount:0,fallbackReason:'coefficient-safety-bound-identity'}
+    }
+    for(const row of solvedCoefficients)for(let i=0;i<row.length;i++)row[i]=Number.isFinite(row[i])?Math.max(-limit,Math.min(limit,row[i])):0
+    const residualMagnitude=Math.sqrt(solvedCoefficients.reduce((sum,row)=>sum+row.reduce((s,v)=>s+v*v,0),0))
+    let numericFallbackCount=0
+    const apply=(color:LinearRGB):LinearRGB=>{
+      const f=transformBasis(color,selected,center), delta=[0,1,2].map(ch=>solvedCoefficients[ch].reduce((sum,value,i)=>sum+value*f[i],0))
+      const output=[color.r+delta[0],color.g+delta[1],color.b+delta[2]]
+      if(output.every(v=>Number.isFinite(v)&&Math.abs(v)<=1e6))return {r:output[0],g:output[1],b:output[2]}
+      numericFallbackCount++
+      return {...color}
+    }
+    if(coefficientClipped)fallbackReason=fallbackReason??'coefficient-safety-bound-applied'
+    return {apply,mode:config.mode,effectiveMode:selected,coefficients:solvedCoefficients,condition,stable:Number.isFinite(condition)&&condition<1e10&&!coefficientClipped,regularization:nonlinear,residualMagnitude,constraintCount:constraints.length,colorSpread:spread,coefficientClipped,get numericFallbackCount(){return numericFallbackCount},...(fallbackReason?{fallbackReason}:{})}
   },
 }
 function selectedFeatureCount(mode: Exclude<TransformMode,'adaptive'>) { return mode==='constant'?1:mode==='affine'?4:7 }
-function finiteBound(n:number){return Number.isFinite(n)?Math.max(-8,Math.min(8,n)):0}
+function solveMode(constraints:ColorConstraint[],config:TransformConfig,center:LinearRGB,mode:Exclude<TransformMode,'adaptive'>,reason:string,condition:number):SolvedTransform{
+  const fallback=weightedRidgeTransform.solve(constraints,{...config,mode})
+  if(fallback.coefficientClipped&&mode==='affine')return solveMode(constraints,config,center,'constant',reason,conditionEstimate(gramFor(constraints,'constant',center)))
+  if(fallback.coefficientClipped&&mode==='constant')return {apply:color=>({...color}),mode:config.mode,effectiveMode:'constant',coefficients:[[0],[0],[0]],condition,stable:false,regularization:fallback.regularization,residualMagnitude:0,constraintCount:constraints.length,colorSpread:fallback.colorSpread,coefficientClipped:true,numericFallbackCount:0,fallbackReason:'coefficient-safety-bound-identity'}
+  return {...fallback,mode:config.mode,fallbackReason:reason,condition,stable:Number.isFinite(condition)&&condition<1e10&&!fallback.coefficientClipped,get numericFallbackCount(){return fallback.numericFallbackCount}}
+}

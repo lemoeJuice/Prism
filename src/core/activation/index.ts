@@ -6,6 +6,10 @@ import type { ActivationAggregatorConfig, ActivationConfig, ActivationHint, Acti
 
 export interface ActivationSeedTexture { constraintId: string; width: number; height: number; values: Float32Array }
 export interface ActivationModel { evaluate(query: PixelFeature, seed: PixelFeature, config: ActivationConfig): number }
+export interface ActivationBreakdown {
+  colorDistance:number;spatialDistance:number;contextDistance:number;edgeDistance:number
+  weightedColor:number;weightedSpatial:number;weightedContext:number;weightedEdge:number;totalDistance:number;activation:number
+}
 export interface ActivationAggregator {
   aggregate(seedValues: readonly number[], hints: readonly ActivationHintSample[], config: ActivationAggregatorConfig): number
 }
@@ -17,7 +21,7 @@ export function normalizeActivationConfig(input:ActivationConfig):ActivationConf
   const requested=Number.isFinite(value.analysisMaxDimension)?value.analysisMaxDimension:512
   const resolution=resolutions.reduce((best,current)=>Math.abs(current-requested)<Math.abs(best-requested)?current:best,512)
   return {
-    ...value,model:'gaussian',preset:validPresets.includes(value.preset)?value.preset:'custom',
+    ...value,model:'appearance-gaussian',preset:validPresets.includes(value.preset)?value.preset:'custom',
     colorWeight:bounded(value.colorWeight,DEFAULT_ACTIVATION.colorWeight,0,20),spatialWeight:bounded(value.spatialWeight,DEFAULT_ACTIVATION.spatialWeight,0,20),
     contextWeight:bounded(value.contextWeight,DEFAULT_ACTIVATION.contextWeight,0,20),edgeWeight:bounded(value.edgeWeight,DEFAULT_ACTIVATION.edgeWeight,0,20),
     contextSmallWeight:bounded(value.contextSmallWeight,1,0,20),contextMediumWeight:bounded(value.contextMediumWeight,.72,0,20),contextLargeWeight:bounded(value.contextLargeWeight,.48,0,20),
@@ -25,7 +29,8 @@ export function normalizeActivationConfig(input:ActivationConfig):ActivationConf
     luminanceGradientWeight:bounded(value.luminanceGradientWeight,.2,0,20),chromaGradientWeight:bounded(value.chromaGradientWeight,.2,0,20),
     spatialScale:bounded(value.spatialScale,.32,.0001,10),colorScale:bounded(value.colorScale,.24,.0001,10),contextScale:bounded(value.contextScale,.38,.0001,10),edgeScale:bounded(value.edgeScale,.45,.0001,10),
     sharpness:bounded(value.sharpness,1,.001,100),analysisMaxDimension:resolution,contextRadii:radii,
-    upsampling:value.upsampling==='bilinear'?'bilinear':'joint-bilateral',upsampleSigma:bounded(value.upsampleSigma,.09,.005,2),
+     downsampling:value.downsampling==='nearest'||value.downsampling==='bilinear'?value.downsampling:'area',
+     upsampling:value.upsampling==='bilinear'?'bilinear':'guided-bilinear',upsampleSigma:bounded(value.upsampleSigma,.09,.005,2),
     hintRadius:bounded(value.hintRadius,.11,.005,1),hintSharpness:bounded(value.hintSharpness,1,.001,100),
   }
 }
@@ -44,6 +49,10 @@ const presetWeights = (config: ActivationConfig) => {
 }
 export const gaussianActivationModel: ActivationModel = {
   evaluate(query, seed, config) {
+    return evaluateAppearanceGaussian(query,seed,config).activation
+  },
+}
+export function evaluateAppearanceGaussian(query:PixelFeature,seed:PixelFeature,config:ActivationConfig):ActivationBreakdown {
     const [wc,ws,wm,we]=presetWeights(config)
     const cs=Math.max(1e-4,config.colorScale), ss=Math.max(1e-4,config.spatialScale), ms=Math.max(1e-4,config.contextScale), es=Math.max(1e-4,config.edgeScale)
     const dc=((query.lab[0]-seed.lab[0])**2 + (query.lab[1]-seed.lab[1])**2 + (query.lab[2]-seed.lab[2])**2)/(cs*cs)
@@ -55,9 +64,9 @@ export const gaussianActivationModel: ActivationModel = {
     }
     context = context / 9 + config.localContrastWeight*(query.localContrast-seed.localContrast)**2/(ms*ms)
     const edge=config.edgeTextureWeight*(query.edgeStrength-seed.edgeStrength)**2/(es*es) + config.luminanceGradientWeight*(query.luminanceGradient-seed.luminanceGradient)**2/(es*es) + config.chromaGradientWeight*(query.chromaGradient-seed.chromaGradient)**2/(es*es)
-    const distance=Math.max(0, wc*dc + ws*dxy + wm*context + we*edge)
-    return Math.min(1,Math.max(0,Math.exp(-0.5*distance*Math.max(0.001,config.sharpness))))
-  },
+    const weightedColor=wc*dc,weightedSpatial=ws*dxy,weightedContext=wm*context,weightedEdge=we*edge
+    const distance=Math.max(0, weightedColor + weightedSpatial + weightedContext + weightedEdge)
+    return {colorDistance:dc,spatialDistance:dxy,contextDistance:context,edgeDistance:edge,weightedColor,weightedSpatial,weightedContext,weightedEdge,totalDistance:distance,activation:Math.min(1,Math.max(0,Math.exp(-0.5*distance*Math.max(0.001,config.sharpness))))}
 }
 
 export const probabilisticOrAggregator: ActivationAggregator = {

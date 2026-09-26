@@ -1,16 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_TRANSFORM } from '../types'
 import type { ColorConstraint } from '../types'
-import { normalizeTransformConfig, weightedRidgeTransform } from './index'
+import { normalizeTransformConfig, transformBasis, weightedRidgeTransform } from './index'
 
 const constraint=(id:string,source:ColorConstraint['source'],target:ColorConstraint['target']):ColorConstraint=>({id,position:{x:0.5,y:0.5},source,target,confidence:1})
 const finite=(values:number[])=>values.every(Number.isFinite)
 
 describe('weighted ridge shared transforms',()=>{
+  it('centers every non-constant root-polynomial basis and is continuous and finite',()=>{
+    const center={r:.3,g:.4,b:.2},atCenter=transformBasis(center,'root-polynomial',center),near=transformBasis({r:.300001,g:.399999,b:.200002},'root-polynomial',center)
+    expect(atCenter[0]).toBe(1);expect(atCenter.slice(1).every(value=>Math.abs(value)<1e-12)).toBe(true)
+    expect(near.every(Number.isFinite)).toBe(true);expect(near.slice(1).every(value=>Math.abs(value)<1e-3)).toBe(true)
+    expect(transformBasis({r:-.4,g:.2,b:.8},'root-polynomial',center).every(Number.isFinite)).toBe(true)
+  })
   it('keeps source-equals-target evidence near identity',()=>{
     const color={r:0.3,g:0.5,b:0.2},solved=weightedRidgeTransform.solve([constraint('identity',color,color)],DEFAULT_TRANSFORM)
     const result=solved.apply(color)
     expect(Math.hypot(result.r-color.r,result.g-color.g,result.b-color.b)).toBeLessThan(1e-6)
+  })
+  it('preserves finite out-of-gamut transform values for the compositor gamut stage',()=>{
+    const source={r:.3,g:.4,b:.2},solved=weightedRidgeTransform.solve([constraint('wide-target',source,{r:1.4,g:.4,b:.2})],{...DEFAULT_TRANSFORM,mode:'constant'}),result=solved.apply(source)
+    expect(result.r).toBeGreaterThan(1)
+    expect(Number.isFinite(result.r)).toBe(true)
   })
   it('is invariant to constraint ordering',()=>{
     const items=[constraint('a',{r:.2,g:.3,b:.4},{r:.26,g:.27,b:.42}),constraint('b',{r:.7,g:.2,b:.1},{r:.64,g:.28,b:.13}),constraint('c',{r:.1,g:.8,b:.4},{r:.14,g:.72,b:.5})]
@@ -38,6 +49,15 @@ describe('weighted ridge shared transforms',()=>{
     expect(finite(Object.values(solved.apply({r:.4,g:.4,b:.4})))).toBe(true)
     const identity=weightedRidgeTransform.solve([],DEFAULT_TRANSFORM).apply({r:.2,g:.4,b:.8})
     expect(identity).toEqual({r:.2,g:.4,b:.8})
+  })
+  it('reports safety-bound fallback instead of hiding an adaptive runaway fit',()=>{
+    const evidence=constraint('runaway',{r:.4,g:.4,b:.4},{r:1e100,g:-1e100,b:1e100}),solved=weightedRidgeTransform.solve([evidence],DEFAULT_TRANSFORM)
+    expect(solved.effectiveMode).toBe('constant');expect(solved.stable).toBe(false);expect(solved.fallbackReason).toBe('coefficient-safety-bound-identity');expect(solved.coefficientClipped).toBe(true)
+    expect(solved.apply(evidence.source)).toEqual(evidence.source)
+  })
+  it('counts identity fallbacks for non-finite or extreme per-pixel outputs',()=>{
+    const solved=weightedRidgeTransform.solve([constraint('small',{r:.2,g:.3,b:.4},{r:.21,g:.29,b:.42})],{...DEFAULT_TRANSFORM,mode:'affine'}),extreme={r:1e100,g:.3,b:.4}
+    expect(solved.apply(extreme)).toEqual(extreme);expect(solved.numericFallbackCount).toBe(1)
   })
   it('normalizes unstable experimental parameters and reports finite solver diagnostics',()=>{
     const config=normalizeTransformConfig({...DEFAULT_TRANSFORM,regularization:NaN,adaptiveRootConditionLimit:Infinity,coefficientLimit:Infinity})

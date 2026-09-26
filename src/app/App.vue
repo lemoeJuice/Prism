@@ -17,9 +17,10 @@ import type { DebugView } from '../core/pipeline'
 import { createLayer, experimentPresets } from '../experiments/presets'
 import { translations } from './locales'
 import type { Locale, TranslationKey } from './locales'
+import type { SyntheticBenchmarkRow } from '../experiments/fixtures/benchmark'
 
-interface WorkerResult {id:string;name:string;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;processingMs:number;outOfGamutRate:number;thumbnails:{id:string;rgba:Uint8Array}[];diagnostics:{id:string;effectiveMode:string;condition:number;stable:boolean;residualMagnitude:number;colorSpread:number;constraintCount:number;coefficients:number[][]}[]}
-interface WorkerResponse {type:string;requestId?:number;width?:number;height?:number;results?:WorkerResult[];message?:string}
+interface WorkerResult {id:string;name:string;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;processingMs:number;runtime?:{featureExtractionMs:number;activationSeedMs:number;aggregationMs:number;transformSolveMs:number;renderPreparationMs:number;renderMs:number};outOfGamutRate:number;thumbnails:{id:string;rgba:Uint8Array}[];diagnostics:{id:string;effectiveMode:string;condition:number;stable:boolean;residualMagnitude:number;colorSpread:number;constraintCount:number;coefficients:number[][];fallbackReason?:string;coefficientClipped:boolean;numericFallbackCount:number}[];featureInspection?:{position:{x:number;y:number};rgb:{r:number;g:number;b:number};query:{lab:[number,number,number];means:number[];variances:number[];localContrast:number;luminanceGradient:number;chromaGradient:number;edgeStrength:number};seed:{lab:[number,number,number];means:number[];variances:number[];localContrast:number;luminanceGradient:number;chromaGradient:number;edgeStrength:number};breakdown:{colorDistance:number;spatialDistance:number;contextDistance:number;edgeDistance:number;weightedColor:number;weightedSpatial:number;weightedContext:number;weightedEdge:number;totalDistance:number;activation:number}}}
+interface WorkerResponse {type:string;requestId?:number;width?:number;height?:number;results?:WorkerResult[];rows?:SyntheticBenchmarkRow[];message?:string}
 function readLocale():Locale{try{return localStorage.getItem('prism-language')==='zh'?'zh':'en'}catch{return'en'}}
 const locale=ref<Locale>(readLocale())
 function t(key:TranslationKey,values:Record<string,string|number>={}){
@@ -33,6 +34,8 @@ const project=ref<Project>(emptyProject()),history=new CommandHistory(project.va
 const worker=new Worker(new URL('../workers/pipeline.worker.ts',import.meta.url),{type:'module'})
 const sourcePixels=ref<Uint8ClampedArray|null>(null),preview=ref<Uint8ClampedArray|null>(null),correctedPixels=ref<Uint8ClampedArray|null>(null)
 const compareResults=ref<WorkerResult[]>([]),thumbnailMap=ref<Record<string,Uint8Array>>({})
+const benchmarkRows=ref<SyntheticBenchmarkRow[]>([]),benchmarkRunning=ref(false)
+const inspectPosition=ref<{x:number;y:number}|undefined>()
 const selectedLayerId=ref(''),selectedConstraintId=ref(''),selectedHintId=ref(''),view=ref<DebugView>('corrected'),compareMode=ref(false)
 const selectedPresetIds=ref<string[]>(['shared-context','spatial-only','color-context'])
 const addMode=ref<'select'|'new-layer'|'constraint'|'include'|'exclude'>('select')
@@ -68,11 +71,11 @@ function setStatus(key:TranslationKey,values:Record<string,string|number>={}){st
 function setError(key:TranslationKey|null,values:Record<string,string|number>={}){errorKey.value=key;errorVars.value=values}
 function presetName(id:string){
   const keys:Record<string,TranslationKey>={'shared-context':'presetSharedContext','spatial-only':'presetSpatial','color-only':'presetColor','color-xy':'presetColorXY','color-context':'presetColorContext','constant-transform':'presetConstant','affine-transform':'presetAffine','sequential':'presetSequential','normalized-mixture':'presetNormalizedMixture','independent':'presetPerPoint','joint-regression':'presetJoint'}
-  return t(keys[id]??'presetSharedContext')
+  return keys[id]?t(keys[id]):experimentPresets.find(item=>item.id===id)?.name??id
 }
 function transformName(mode:string){const keys:Record<string,TranslationKey>={adaptive:'adaptive',constant:'constant',affine:'affine','root-polynomial':'rootPolynomial'};return t(keys[mode]??'pending')}
 function viewLabelKey(value:DebugView):TranslationKey{
-  const keys:Record<DebugView,TranslationKey>={corrected:'viewCorrected',original:'viewOriginal',split:'viewSplit',difference:'viewDifference',seed:'viewSeed',activation:'viewActivation','activation-overlay':'viewActivationOverlay',dominant:'viewDominant',contribution:'viewContribution','total-correction':'viewTotalCorrection','out-of-gamut':'viewOutOfGamut'}
+  const keys:Record<DebugView,TranslationKey>={corrected:'viewCorrected',original:'viewOriginal',split:'viewSplit',difference:'viewDifference',seed:'viewSeed',activation:'viewActivation','activation-overlay':'viewActivationOverlay',dominant:'viewDominant','dominant-seed':'viewDominantSeed','hint-contribution':'viewHintContribution',contribution:'viewContribution','total-correction':'viewTotalCorrection','out-of-gamut':'viewOutOfGamut','distance-color':'viewDistanceColor','distance-spatial':'viewDistanceSpatial','distance-context':'viewDistanceContext','distance-edge':'viewDistanceEdge','distance-total':'viewDistanceTotal'}
   return keys[value]
 }
 function measureCanvasViewport(){
@@ -85,6 +88,8 @@ function commit(label:string,reduce:(current:Project)=>Project){project.value=hi
 function updateLayer(id:string,label:string,update:(layer:CorrectionLayer)=>CorrectionLayer){commit(label,current=>({...current,layers:current.layers.map(layer=>layer.id===id?update(layer):layer)}))}
 function onWorkerMessage(event:MessageEvent<WorkerResponse>){
   const message=event.data
+  if(message.type==='synthetic-benchmark-results'){benchmarkRows.value=message.rows??[];benchmarkRunning.value=false;return}
+  if(message.type==='synthetic-benchmark-error'){benchmarkRunning.value=false;setError('workerError',{message:message.message??'Synthetic benchmark failed'});return}
   if(message.type==='image-ready'){imageReady=true;setStatus('statusImageReady',{dimensions:dimensionsLabel.value});scheduleRender();return}
   if(message.type==='error'){if(message.requestId===latestRequest){isRendering.value=false;setError('workerError',{message:message.message??t('statusProcessingError')});setStatus('statusProcessingError')}return}
   if(message.type!=='rendered'||message.requestId!==latestRequest||!message.results)return
@@ -107,7 +112,7 @@ function scheduleRender(){
   isRendering.value=true
   renderTimer=window.setTimeout(()=>{
     const id=++requestId;latestRequest=id
-    worker.postMessage({type:'render',requestId:id,layers:clonePlain(project.value.layers),pipeline:clonePlain(project.value.pipeline),variants:activeVariants(),view:view.value,selectedLayerId:selectedLayerId.value,selectedConstraintId:selectedConstraintId.value})
+     worker.postMessage({type:'render',requestId:id,layers:clonePlain(project.value.layers),pipeline:clonePlain(project.value.pipeline),variants:activeVariants(),view:view.value,selectedLayerId:selectedLayerId.value,selectedConstraintId:selectedConstraintId.value,inspectPosition:inspectPosition.value})
   },80)
 }
 watch([project,view,selectedLayerId,selectedConstraintId,compareMode,selectedPresetIds],scheduleRender,{deep:true})
@@ -215,6 +220,7 @@ function onStageClick(event:MouseEvent){
     updateLayer(activeLayer.value.id,`Add ${hint.type} hint`,layer=>({...layer,activationHints:[...layer.activationHints,hint]}));selectedConstraintId.value='';selectedHintId.value=hint.id;addMode.value='select';return
   }
   if(addMode.value==='new-layer'||addMode.value==='constraint'||!activeLayer.value){addConstraintAt(position);return}
+  inspectPosition.value=position;scheduleRender()
 }
 function startConstraintDrag(event:PointerEvent,constraintId:string){event.stopPropagation();selectedConstraintId.value=constraintId;draggingConstraint.value=constraintId;dragPosition.value=null;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)}
 function startHintDrag(event:PointerEvent,layerId:string,hintId:string){event.stopPropagation();selectHint(layerId,hintId);draggingHint.value=hintId;hintDragPosition.value=null;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)}
@@ -288,7 +294,7 @@ function setActivationScale(key:'spatialScale'|'colorScale'|'contextScale'|'edge
 function setContextRadius(index:number,event:Event){if(activeLayer.value){const contextRadii=[...activeLayer.value.activationConfig.contextRadii] as [number,number,number],value=Number((event.target as HTMLInputElement).value);contextRadii[index]=value;updateLayer(activeLayer.value.id,'Change context scale',layer=>({...layer,activationConfig:{...layer.activationConfig,contextRadii}}))}}
 function setAggregatorTemperature(event:Event){if(activeLayer.value){const temperature=Number((event.target as HTMLInputElement).value);updateLayer(activeLayer.value.id,'Change aggregator temperature',layer=>({...layer,activationAggregator:{...layer.activationAggregator,temperature}}))}}
 function setAnalysisSize(event:Event){if(activeLayer.value){const value=Number((event.target as HTMLSelectElement).value) as 256|512|1024;updateLayer(activeLayer.value.id,'Change analysis resolution',layer=>({...layer,activationConfig:{...layer.activationConfig,analysisMaxDimension:value}}))}}
-function setUpsampling(event:Event){if(activeLayer.value){const value=(event.target as HTMLSelectElement).value as 'bilinear'|'joint-bilateral';updateLayer(activeLayer.value.id,'Change activation upsampling',layer=>({...layer,activationConfig:{...layer.activationConfig,upsampling:value}}))}}
+function setUpsampling(event:Event){if(activeLayer.value){const value=(event.target as HTMLSelectElement).value as 'bilinear'|'guided-bilinear';updateLayer(activeLayer.value.id,'Change activation upsampling',layer=>({...layer,activationConfig:{...layer.activationConfig,upsampling:value}}))}}
 function setAggregator(event:Event){if(activeLayer.value){const type=(event.target as HTMLSelectElement).value as 'probabilistic-or'|'smooth-max';updateLayer(activeLayer.value.id,'Change activation aggregator',layer=>({...layer,activationAggregator:{...layer.activationAggregator,type}}))}}
 function setCompositor(event:Event){const compositor=(event.target as HTMLSelectElement).value as Project['pipeline']['compositor'];commit('Change compositor',current=>({...current,pipeline:{...current.pipeline,compositor}}))}
 function selectHint(layerId:string,hintId:string){selectedLayerId.value=layerId;selectedConstraintId.value='';selectedHintId.value=hintId;addMode.value='select'}
@@ -308,6 +314,7 @@ function togglePreset(id:string){
   selectedPresetIds.value=next.length?next:[id]
   commit('Change compare presets',current=>({...current,comparePresetIds:[...selectedPresetIds.value]}))
 }
+function runSyntheticBenchmark(){benchmarkRunning.value=true;worker.postMessage({type:'synthetic-benchmark'})}
 function changeZoom(amount:number){zoom.value=Math.max(0.4,Math.min(2.5,zoom.value+amount))}
 function onWheel(event:WheelEvent){if(event.ctrlKey||event.metaKey){event.preventDefault();changeZoom(event.deltaY<0?0.1:-0.1)}}
 function thumbnailData(resultId:string,layerId:string){return thumbnailMap.value[`${resultId}:${layerId}`]}
@@ -370,7 +377,7 @@ function thumbnailUrl(resultId:string,layerId:string){
             <button :class="{selected:addMode==='exclude'}" :disabled="!activeLayer" :title="t('excludeTool')" @click="addMode=addMode==='exclude'?'select':'exclude'"><Minus :size="15"/></button>
           </div>
           <div class="tool-separator"></div>
-          <label class="view-select-label"><ScanEye :size="15"/><select v-model="view" :aria-label="t('previewView')"><option value="corrected">{{ t('viewCorrected') }}</option><option value="original">{{ t('viewOriginal') }}</option><option value="split">{{ t('viewSplit') }}</option><option value="difference">{{ t('viewDifference') }}</option><option value="seed">{{ t('viewSeed') }}</option><option value="activation">{{ t('viewActivation') }}</option><option value="activation-overlay">{{ t('viewActivationOverlay') }}</option><option value="dominant">{{ t('viewDominant') }}</option><option value="contribution">{{ t('viewContribution') }}</option><option value="total-correction">{{ t('viewTotalCorrection') }}</option><option value="out-of-gamut">{{ t('viewOutOfGamut') }}</option></select><ChevronDown :size="13"/></label>
+           <label class="view-select-label"><ScanEye :size="15"/><select v-model="view" :aria-label="t('previewView')"><option value="corrected">{{ t('viewCorrected') }}</option><option value="original">{{ t('viewOriginal') }}</option><option value="split">{{ t('viewSplit') }}</option><option value="difference">{{ t('viewDifference') }}</option><option value="seed">{{ t('viewSeed') }}</option><option value="activation">{{ t('viewActivation') }}</option><option value="activation-overlay">{{ t('viewActivationOverlay') }}</option><option value="distance-color">{{ t('viewDistanceColor') }}</option><option value="distance-spatial">{{ t('viewDistanceSpatial') }}</option><option value="distance-context">{{ t('viewDistanceContext') }}</option><option value="distance-edge">{{ t('viewDistanceEdge') }}</option><option value="distance-total">{{ t('viewDistanceTotal') }}</option><option value="dominant-seed">{{ t('viewDominantSeed') }}</option><option value="hint-contribution">{{ t('viewHintContribution') }}</option><option value="dominant">{{ t('viewDominant') }}</option><option value="contribution">{{ t('viewContribution') }}</option><option value="total-correction">{{ t('viewTotalCorrection') }}</option><option value="out-of-gamut">{{ t('viewOutOfGamut') }}</option></select><ChevronDown :size="13"/></label>
           <div class="toolbar-spacer"></div>
           <button class="icon-button" :title="t('zoomOut')" @click="changeZoom(-0.1)"><Minus :size="15"/></button><span class="zoom-value">{{ Math.round(zoom*100) }}%</span><button class="icon-button" :title="t('zoomIn')" @click="changeZoom(0.1)"><Plus :size="15"/></button>
           <button class="compare-toggle" :class="{active:compareMode}" @click="compareMode=!compareMode"><ArrowLeftRight :size="14"/> {{ t('compare') }}</button>
@@ -389,7 +396,7 @@ function thumbnailUrl(resultId:string,layerId:string){
               <div v-else-if="addMode==='include'||addMode==='exclude'" class="canvas-instruction" :class="addMode"><span class="hint-symbol" :class="addMode">{{ addMode==='include'?'+':'−' }}</span> {{ addMode==='include'?t('includeClick'):t('excludeClick') }}</div>
             </div>
             <div v-if="compareMode" class="compare-grid">
-              <article v-for="result in compareResults" :key="result.id" class="compare-card"><div class="compare-card-title"><span>{{ result.name }}</span><span>{{ result.processingMs.toFixed(0) }} ms</span></div><div class="compare-image" :style="{aspectRatio:`${width}/${height}`}" ><PreviewCanvas :pixels="result.corrected" :width="width" :height="height" :label="`${result.name} · ${t('viewCorrected')}`"/></div><div class="compare-card-meta"><span>{{ (result.outOfGamutRate*100).toFixed(2) }}%{{ t('outOfGamutRate') }}</span><span>{{ t('variantMeta',{count:project.layers.length}) }}</span></div></article>
+              <article v-for="result in compareResults" :key="result.id" class="compare-card"><div class="compare-card-title"><span>{{ result.name }}</span><span>{{ result.processingMs.toFixed(0) }} ms</span></div><div class="compare-image" :style="{aspectRatio:`${width}/${height}`}" ><PreviewCanvas :pixels="result.corrected" :width="width" :height="height" :label="`${result.name} · ${t('viewCorrected')}`"/></div><div class="compare-card-meta"><span>{{ (result.outOfGamutRate*100).toFixed(2) }}%{{ t('outOfGamutRate') }}</span><span>{{ t('variantMeta',{count:project.layers.length}) }}</span></div><small v-if="result.runtime" class="runtime-breakdown">features {{ result.runtime.featureExtractionMs.toFixed(1) }} · seeds {{ result.runtime.activationSeedMs.toFixed(1) }} · aggregate {{ result.runtime.aggregationMs.toFixed(1) }} · solve {{ result.runtime.transformSolveMs.toFixed(1) }} · prep {{ result.runtime.renderPreparationMs.toFixed(1) }} · render {{ result.runtime.renderMs.toFixed(1) }} ms</small></article>
             </div>
           </template>
         </div>
@@ -413,6 +420,15 @@ function thumbnailUrl(resultId:string,layerId:string){
                 <button v-for="(constraint,index) in activeLayer.constraints" :key="constraint.id" class="seed-row" :class="{selected:selectedConstraintId===constraint.id}" @click="selectedConstraintId=constraint.id;view='seed'"><span class="seed-number">{{ String(index+1).padStart(2,'0') }}</span><span class="seed-color" :style="{background:rgbHex(constraint.source)}"></span><span class="seed-row-copy"><strong>{{ rgbHex(constraint.source).toUpperCase() }}</strong><small>{{ t('originalSample') }} · {{ t('confidence') }} {{ Math.round(constraint.confidence*100) }}%</small></span><ScanEye :size="14"/></button>
                 <div v-if="!activeLayer.constraints.length" class="inline-empty">{{ t('noConstraints') }}</div>
               </section>
+              <section v-if="compareResults[0]?.featureInspection" class="inspector-section compact-section feature-inspector">
+                <div class="section-title"><div><span class="eyebrow">PIXEL FEATURE INSPECTOR</span><h3>Query vs selected seed</h3></div></div>
+                <small>xy {{ compareResults[0].featureInspection.position.x.toFixed(3) }}, {{ compareResults[0].featureInspection.position.y.toFixed(3) }} · linear RGB {{ compareResults[0].featureInspection.rgb.r.toFixed(3) }}, {{ compareResults[0].featureInspection.rgb.g.toFixed(3) }}, {{ compareResults[0].featureInspection.rgb.b.toFixed(3) }}</small>
+                <small>OKLab {{ compareResults[0].featureInspection.query.lab.map(v=>v.toFixed(3)).join(', ') }} · seed {{ compareResults[0].featureInspection.seed.lab.map(v=>v.toFixed(3)).join(', ') }}</small>
+                <div v-for="(label,index) in ['small','medium','large']" :key="label" class="feature-scale-row"><b>{{ label }}</b><span>query μ {{ compareResults[0].featureInspection.query.means.slice(index*3,index*3+3).map(v=>v.toFixed(3)).join(', ') }}</span><span>query σ² {{ compareResults[0].featureInspection.query.variances.slice(index*3,index*3+3).map(v=>v.toFixed(4)).join(', ') }}</span><span>seed μ {{ compareResults[0].featureInspection.seed.means.slice(index*3,index*3+3).map(v=>v.toFixed(3)).join(', ') }}</span><span>seed σ² {{ compareResults[0].featureInspection.seed.variances.slice(index*3,index*3+3).map(v=>v.toFixed(4)).join(', ') }}</span></div>
+                <small>contrast {{ compareResults[0].featureInspection.query.localContrast.toFixed(4) }} · ∇L {{ compareResults[0].featureInspection.query.luminanceGradient.toFixed(4) }} · ∇C {{ compareResults[0].featureInspection.query.chromaGradient.toFixed(4) }} · edge {{ compareResults[0].featureInspection.query.edgeStrength.toFixed(4) }}</small>
+                <small>seed contrast {{ compareResults[0].featureInspection.seed.localContrast.toFixed(4) }} · ∇L {{ compareResults[0].featureInspection.seed.luminanceGradient.toFixed(4) }} · ∇C {{ compareResults[0].featureInspection.seed.chromaGradient.toFixed(4) }} · edge {{ compareResults[0].featureInspection.seed.edgeStrength.toFixed(4) }}</small>
+                <small>distance color {{ compareResults[0].featureInspection.breakdown.colorDistance.toFixed(3) }} · context {{ compareResults[0].featureInspection.breakdown.contextDistance.toFixed(3) }} · edge {{ compareResults[0].featureInspection.breakdown.edgeDistance.toFixed(3) }}</small>
+              </section>
               <section class="inspector-section controls-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('model') }}</span><h3>{{ t('gaussianFeatureDistance') }}</h3></div></div>
                 <label class="control-row"><span>{{ t('featurePreset') }}</span><select :value="activeLayer.activationConfig.preset" @change="setActivationPreset"><option value="spatial-only">{{ t('presetSpatial') }}</option><option value="color-only">{{ t('presetColor') }}</option><option value="color+xy">{{ t('presetColorXY') }}</option><option value="color+context">{{ t('presetColorContext') }}</option><option value="color+context+edge">{{ t('presetColorContextEdge') }}</option><option value="custom">{{ t('presetCustom') }}</option></select></label>
@@ -434,8 +450,9 @@ function thumbnailUrl(resultId:string,layerId:string){
                   <div class="range-control"><div><span>{{ t('upsampleSigma') }}</span><b>{{ activeLayer.activationConfig.upsampleSigma.toFixed(2) }}</b></div><input type="range" min="0.02" max="0.3" step="0.01" :value="activeLayer.activationConfig.upsampleSigma" @input="setActivationScale('upsampleSigma',$event)"/></div>
                   <div v-if="activeLayer.activationAggregator.type==='smooth-max'" class="range-control"><div><span>{{ t('smoothMaxTemperature') }}</span><b>{{ activeLayer.activationAggregator.temperature.toFixed(2) }}</b></div><input type="range" min="0.01" max="0.5" step="0.01" :value="activeLayer.activationAggregator.temperature" @input="setAggregatorTemperature"/></div>
                 </details>
-                <label class="control-row"><span>{{ t('analysisResolution') }}</span><select :value="activeLayer.activationConfig.analysisMaxDimension" @change="setAnalysisSize"><option :value="256">256 px</option><option :value="512">512 px</option><option :value="1024">1024 px</option></select></label>
-                <label class="control-row"><span>{{ t('fieldUpsampling') }}</span><select :value="activeLayer.activationConfig.upsampling" @change="setUpsampling"><option value="joint-bilateral">{{ t('jointBilateral') }}</option><option value="bilinear">{{ t('bilinear') }}</option></select></label>
+                 <label class="control-row"><span>{{ t('analysisResolution') }}</span><select :value="activeLayer.activationConfig.analysisMaxDimension" @change="setAnalysisSize"><option :value="256">256 px</option><option :value="512">512 px</option><option :value="1024">1024 px</option></select></label>
+                 <label class="control-row"><span>{{ t('analysisDownsampling') }}</span><select :value="activeLayer.activationConfig.downsampling" @change="updateLayer(activeLayer.id,'Change analysis downsampling',layer=>({...layer,activationConfig:{...layer.activationConfig,downsampling:($event.target as HTMLSelectElement).value as 'nearest'|'bilinear'|'area'}}))"><option value="area">{{ t('areaDownsampling') }}</option><option value="bilinear">{{ t('bilinear') }}</option><option value="nearest">Nearest baseline</option></select></label>
+                 <label class="control-row"><span>{{ t('fieldUpsampling') }}</span><select :value="activeLayer.activationConfig.upsampling" @change="setUpsampling"><option value="guided-bilinear">{{ t('guidedBilinear') }}</option><option value="bilinear">{{ t('bilinear') }}</option></select></label>
               </section>
               <section class="inspector-section hints-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('scopeHints') }}</span><h3>{{ t('lightweightHints') }}</h3></div></div>
@@ -464,7 +481,7 @@ function thumbnailUrl(resultId:string,layerId:string){
                   <div class="range-control"><div><span>{{ t('coefficientLimit') }}</span><b>{{ activeLayer.transformConfig.coefficientLimit.toFixed(1) }}</b></div><input type="range" min="0.25" max="10" step="0.25" :value="activeLayer.transformConfig.coefficientLimit" @input="setTransformParameter('coefficientLimit',$event)"/></div>
                 </details>
                 <div class="transform-stat-grid"><div><span>{{ t('constraints') }}</span><strong>{{ layerDiagnostics?.constraintCount??activeLayer.constraints.length }}</strong></div><div><span>{{ t('effectiveModel') }}</span><strong>{{ layerDiagnostics?transformName(layerDiagnostics.effectiveMode):t('pending') }}</strong></div><div><span>{{ t('stability') }}</span><strong>{{ layerDiagnostics?layerDiagnostics.stable?t('stable'):t('regularized'):t('pending') }}</strong></div></div>
-                <div class="matrix-placeholder"><span class="eyebrow">{{ t('solverDiagnostics') }}</span><div class="diagnostic-numbers"><div><span>{{ t('condition') }}</span><b>{{ layerDiagnostics?layerDiagnostics.condition.toExponential(2):'—' }}</b></div><div><span>{{ t('residualNorm') }}</span><b>{{ layerDiagnostics?.residualMagnitude.toFixed(4)??'—' }}</b></div><div><span>{{ t('colorSpread') }}</span><b>{{ layerDiagnostics?.colorSpread.toFixed(4)??'—' }}</b></div></div><div v-if="layerDiagnostics" class="coefficient-matrix"><div v-for="(row,index) in layerDiagnostics.coefficients" :key="index"><span>{{ ['ΔR','ΔG','ΔB'][index] }}</span><code v-for="(value,column) in row" :key="column">{{ value.toFixed(3) }}</code></div></div><p>{{ t('solverDescription') }}</p></div>
+                 <div class="matrix-placeholder"><span class="eyebrow">{{ t('solverDiagnostics') }}</span><div class="diagnostic-numbers"><div><span>{{ t('condition') }}</span><b>{{ layerDiagnostics?layerDiagnostics.condition.toExponential(2):'—' }}</b></div><div><span>{{ t('residualNorm') }}</span><b>{{ layerDiagnostics?.residualMagnitude.toFixed(4)??'—' }}</b></div><div><span>{{ t('colorSpread') }}</span><b>{{ layerDiagnostics?.colorSpread.toFixed(4)??'—' }}</b></div></div><div v-if="layerDiagnostics" class="coefficient-matrix"><div v-for="(row,index) in layerDiagnostics.coefficients" :key="index"><span>{{ ['ΔR','ΔG','ΔB'][index] }}</span><code v-for="(value,column) in row" :key="column">{{ value.toFixed(3) }}</code></div></div><p v-if="layerDiagnostics?.fallbackReason" class="fallback-reason">{{ t('fallbackReason') }}: {{ layerDiagnostics.fallbackReason }}</p><p v-if="layerDiagnostics?.coefficientClipped||layerDiagnostics?.numericFallbackCount" class="fallback-reason">Coefficient safety bound: {{ layerDiagnostics.coefficientClipped }} · numeric identity fallbacks: {{ layerDiagnostics.numericFallbackCount }}</p><p>{{ t('solverDescription') }}</p></div>
               </section>
               <section class="inspector-section compact-section">
                 <div class="section-title"><div><span class="eyebrow">{{ t('colorEvidence') }}</span><h3>{{ t('constraintTargets') }}</h3></div></div>
@@ -486,7 +503,7 @@ function thumbnailUrl(resultId:string,layerId:string){
       </aside>
     </div>
 
-    <div v-if="compareMode" class="compare-dock"><div class="compare-dock-title"><div><span class="eyebrow">{{ t('compareMode') }}</span><strong>{{ t('sameIntent') }}</strong></div><span class="variant-count">{{ selectedPresetIds.length }} {{ t('variants') }}</span></div><div class="preset-list"><button v-for="preset in experimentPresets" :key="preset.id" :class="{checked:selectedPresetIds.includes(preset.id)}" @click="togglePreset(preset.id)"><span class="preset-check"><Check v-if="selectedPresetIds.includes(preset.id)" :size="11"/></span>{{ presetName(preset.id) }}</button></div><div class="baseline-hooks"><span>{{ t('architectureHooks') }}</span><span>{{ t('perPointBaseline') }}</span><span class="hook-active">{{ t('sharedLayerBaseline') }}</span><span>{{ t('jointRegressionBaseline') }}</span></div></div>
+    <div v-if="compareMode" class="compare-dock"><div class="compare-dock-title"><div><span class="eyebrow">{{ t('compareMode') }}</span><strong>{{ t('sameIntent') }}</strong></div><span class="variant-count">{{ selectedPresetIds.length }} {{ t('variants') }}</span></div><div class="preset-list"><button v-for="preset in experimentPresets" :key="preset.id" :class="{checked:selectedPresetIds.includes(preset.id)}" @click="togglePreset(preset.id)"><span class="preset-check"><Check v-if="selectedPresetIds.includes(preset.id)" :size="11"/></span>{{ presetName(preset.id) }}</button></div><div class="baseline-hooks"><span>{{ t('architectureHooks') }}</span><span>{{ t('perPointBaseline') }}</span><span class="hook-active">{{ t('sharedLayerBaseline') }}</span><span>{{ t('jointRegressionBaseline') }}</span></div><div class="synthetic-bench-toolbar"><div><strong>{{ t('syntheticBenchmarks') }}</strong><small>{{ t('syntheticBenchmarksHelp') }}</small></div><button class="button secondary" :disabled="benchmarkRunning" @click="runSyntheticBenchmark">{{ benchmarkRunning?t('benchmarkRunning'):t('runBenchmarks') }}</button></div><div v-if="benchmarkRows.length" class="synthetic-benchmark-table"><div class="benchmark-row benchmark-heading"><span>Fixture / variant</span><span>Mean / median / p95 ΔEOK</span><span>Activation in / out / leakage</span><span>Runtime</span></div><div v-for="(row,index) in benchmarkRows" :key="`${row.fixture}-${row.variant}-${index}`" class="benchmark-row"><span>{{ row.fixture }}<small>{{ row.variant }}</small></span><span>{{ row.metrics.meanDeltaEOK.toFixed(4) }} / {{ row.metrics.medianDeltaEOK.toFixed(4) }} / {{ row.metrics.p95DeltaEOK.toFixed(4) }}</span><span>{{ row.metrics.activationInside?.toFixed(3)??'—' }} / {{ row.metrics.activationOutside?.toFixed(3)??'—' }} / {{ row.metrics.activationLeakageRatio?.toFixed(3)??'—' }}</span><span>{{ row.metrics.runtimeMs.toFixed(1) }} ms</span></div></div></div>
   </div>
   <div v-if="helpOpen" class="modal-backdrop" @click.self="helpOpen=false">
     <section class="help-modal" role="dialog" aria-modal="true" :aria-label="t('helpTitle')">
@@ -514,4 +531,19 @@ function thumbnailUrl(resultId:string,layerId:string){
 .seed-row>svg{grid-column:4}
 .layer-card .strength-range{position:relative;z-index:1;display:block;width:100%;margin:8px 0 12px}
 .layer-card .constraint-list{position:relative;z-index:0}
+.feature-inspector>small{display:block;color:#b4bcae;font-size:10px;line-height:1.5;margin:5px 0;overflow-wrap:anywhere}
+.feature-scale-row{display:grid;grid-template-columns:42px 1fr 1fr;gap:4px;padding:5px 0;border-top:1px solid #333b31;color:#aeb6a9;font-size:9px}
+.feature-scale-row b{grid-row:span 4;color:#e0e8d8;text-transform:capitalize}
+.feature-scale-row span{overflow-wrap:anywhere}
+.fallback-reason{color:#f3c47e!important}
+.runtime-breakdown{display:block;color:#aeb6a9;font-size:9px;line-height:1.5;padding:0 10px 8px;overflow-wrap:anywhere}
+.synthetic-bench-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0 8px;border-top:1px solid #394035}
+.synthetic-bench-toolbar strong,.synthetic-bench-toolbar small{display:block}
+.synthetic-bench-toolbar small{font-size:10px;color:#aeb6a9;margin-top:3px}
+.synthetic-benchmark-table{max-height:260px;overflow:auto;border:1px solid #394035;border-radius:8px}
+.benchmark-row{display:grid;grid-template-columns:minmax(190px,1.2fr) minmax(160px,1fr) minmax(180px,1.1fr) 80px;gap:10px;padding:6px 9px;border-bottom:1px solid #30372e;font-size:10px;color:#c3cbbb}
+.benchmark-row:last-child{border-bottom:0}
+.benchmark-row>span:first-child small{display:block;color:#909a8b;margin-top:2px}
+.benchmark-heading{position:sticky;top:0;background:#22281f;color:#e4ebdd;font-weight:600;z-index:1}
+@media(max-width:900px){.benchmark-row{grid-template-columns:minmax(120px,1fr) 1fr 1fr}.benchmark-row>span:last-child{display:none}}
 </style>

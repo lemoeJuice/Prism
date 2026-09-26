@@ -63,4 +63,11 @@ describe('pipeline invariants',()=>{
     expect(Array.from(output.corrected).every(Number.isFinite)).toBe(true)
     expect(Array.from(output.debug[0].transform.coefficients.flat()).every(Number.isFinite)).toBe(true)
   })
+  it('exposes selected-constraint distance, dominant-seed and hint contribution diagnostics on demand',async()=>{
+    const input=fixture(),layer=createLayer('inspect','Inspect');layer.constraints=[makeConstraint('inspect-seed',.2)];layer.activationHints=[{id:'include',position:{x:.8,y:.5},type:'include',strength:.8,radius:.2}]
+    const output=await runPipeline(input,'fixture-inspect',[layer],DEFAULT_PIPELINE,variant,'distance-total',layer.id,'inspect-seed')
+    expect(output.debug[0].breakdown).toHaveLength(output.debug[0].breakdownWidth!*output.debug[0].breakdownHeight!)
+    expect(output.debug[0].dominantSeed).toBeDefined();expect(output.debug[0].hintContribution).toBeDefined()
+    expect(output.debug[0].hintContribution?.some(value=>Math.abs(value)>0)).toBe(true)
+  })
 })

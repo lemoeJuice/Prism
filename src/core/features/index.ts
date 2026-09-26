@@ -26,16 +26,30 @@ export interface AnalysisImage { width: number; height: number; data: Uint8Clamp
 export interface FeatureConfig { contextRadii: readonly [number,number,number] }
 export interface FeatureExtractor { analyze(image:AnalysisImage,config:FeatureConfig):Promise<FeatureMap> }
 
-export function makeAnalysisImage(image: AnalysisImage, maxDimension: number): AnalysisImage {
+export type AnalysisDownsampleMode='nearest'|'bilinear'|'area'
+export function makeAnalysisImage(image: AnalysisImage, maxDimension: number, mode:AnalysisDownsampleMode='area'): AnalysisImage {
   const scale = Math.min(1, maxDimension / Math.max(image.width, image.height))
   const width = Math.max(1, Math.round(image.width * scale)), height = Math.max(1, Math.round(image.height * scale))
   if (width === image.width && height === image.height) return image
   const data = new Uint8ClampedArray(width * height * 4)
   for (let y=0; y<height; y++) for (let x=0; x<width; x++) {
-    const sx = Math.min(image.width-1, Math.round((x + 0.5) * image.width / width - 0.5))
-    const sy = Math.min(image.height-1, Math.round((y + 0.5) * image.height / height - 0.5))
-    const si = (sy*image.width+sx)*4, di = (y*width+x)*4
-    data[di]=image.data[si]; data[di+1]=image.data[si+1]; data[di+2]=image.data[si+2]; data[di+3]=image.data[si+3]
+    const di=(y*width+x)*4
+    if(mode==='nearest'){
+      const sx=Math.min(image.width-1,Math.round((x+.5)*image.width/width-.5)),sy=Math.min(image.height-1,Math.round((y+.5)*image.height/height-.5)),si=(sy*image.width+sx)*4
+      data.set(image.data.subarray(si,si+4),di);continue
+    }
+    if(mode==='bilinear'){
+      const fx=(x+.5)*image.width/width-.5,fy=(y+.5)*image.height/height-.5,x0=Math.max(0,Math.floor(fx)),y0=Math.max(0,Math.floor(fy)),x1=Math.min(image.width-1,x0+1),y1=Math.min(image.height-1,y0+1),tx=Math.max(0,fx-x0),ty=Math.max(0,fy-y0)
+      for(let c=0;c<4;c++){const a=image.data[(y0*image.width+x0)*4+c]*(1-tx)+image.data[(y0*image.width+x1)*4+c]*tx,b=image.data[(y1*image.width+x0)*4+c]*(1-tx)+image.data[(y1*image.width+x1)*4+c]*tx;data[di+c]=Math.round(a*(1-ty)+b*ty)}
+      continue
+    }
+    const left=x*image.width/width,right=(x+1)*image.width/width,top=y*image.height/height,bottom=(y+1)*image.height/height
+    let total=0,sums=[0,0,0,0]
+    for(let sy=Math.floor(top);sy<Math.ceil(bottom);sy++)for(let sx=Math.floor(left);sx<Math.ceil(right);sx++){
+      const weight=Math.max(0,Math.min(right,sx+1)-Math.max(left,sx))*Math.max(0,Math.min(bottom,sy+1)-Math.max(top,sy)),si=(Math.min(image.height-1,sy)*image.width+Math.min(image.width-1,sx))*4
+      total+=weight;for(let c=0;c<4;c++)sums[c]+=image.data[si+c]*weight
+    }
+    if(total)for(let c=0;c<4;c++)data[di+c]=Math.round(sums[c]/total)
   }
   return { width, height, data }
 }
