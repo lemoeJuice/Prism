@@ -1,0 +1,16 @@
+{
+  "description": "Compare Mode variants. Variants share the active photo, correction layers, constraints and hints; only listed algorithm strategies differ.",
+  "presets": [
+    { "id": "shared-context", "name": "Context + edge", "activation": "color+context+edge", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "spatial-only", "name": "Spatial-only", "activation": "spatial-only", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "color-only", "name": "Color-only", "activation": "color-only", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "color-xy", "name": "Color + XY", "activation": "color+xy", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "color-context", "name": "Color + context", "activation": "color+context", "aggregator": "smooth-max", "transform": "root-polynomial", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "constant-transform", "name": "Constant transform", "activation": "color+context+edge", "aggregator": "probabilistic-or", "transform": "constant", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "affine-transform", "name": "Affine transform", "activation": "color+context+edge", "aggregator": "probabilistic-or", "transform": "affine", "compositor": "residual-add", "architecture": "shared-correction-layer" },
+    { "id": "sequential", "name": "Sequential compositor", "activation": "color+context+edge", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "sequential", "architecture": "shared-correction-layer" },
+    { "id": "normalized-mixture", "name": "Normalized mixture", "activation": "color+context+edge", "aggregator": "probabilistic-or", "transform": "adaptive", "compositor": "normalized-mixture", "architecture": "shared-correction-layer" },
+    { "id": "independent", "name": "Per-point baseline", "activation": "color+xy", "aggregator": "probabilistic-or", "transform": "constant", "compositor": "normalized-mixture", "architecture": "per-point-independent-layer" },
+    { "id": "joint-regression", "name": "Joint per-pixel baseline", "activation": "color+xy", "aggregator": "probabilistic-or", "transform": "affine", "compositor": "residual-add", "architecture": "joint-per-pixel-regression", "status": "simplified-local-constant-residual" }
+  ]
+}
