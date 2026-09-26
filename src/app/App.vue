@@ -114,6 +114,7 @@ watch(locale,()=>{document.documentElement.lang=locale.value;document.title=t('d
 
 async function loadPhoto(file:File){
   setError(null)
+  if(width.value&&project.value.layers.length&&window.confirm(t('saveBeforeImport'))){saveProject()}
   try {
     if(renderTimer)window.clearTimeout(renderTimer)
     latestRequest=++requestId;isRendering.value=false;imageReady=false
@@ -323,7 +324,7 @@ function thumbnailUrl(resultId:string,layerId:string){
     <div class="workspace-grid">
       <aside class="left-panel panel">
         <div class="panel-heading"><div><span class="eyebrow">{{ t('editStack') }}</span><h2>{{ t('corrections') }} <span class="count-badge">{{ project.layers.length }}</span></h2></div><button class="icon-button add-layer" :title="t('createLayer')" @click="createNewLayer"><Plus :size="17" /></button></div>
-        <label class="button import-button"><Upload :size="15" /> {{ t('importPhoto') }}<input type="file" accept="image/*" @change="choosePhoto"></label>
+        <label class="button import-button" :title="width?project.image.name:t('importPhoto')"><Upload :size="15" /> {{ width?project.image.name:t('importPhoto') }}<input type="file" accept="image/*" @change="choosePhoto"></label>
         <div v-if="!project.layers.length" class="empty-layers"><div class="empty-icon"><Layers3 :size="22" /></div><strong>{{ t('noLayers') }}</strong><p>{{ t('noLayersHelp') }}</p><button class="text-button" :disabled="!width" @click="addMode='new-layer'"><Plus :size="14" /> {{ t('startFirstCorrection') }}</button></div>
         <div v-else class="layer-list">
           <article v-for="(layer,index) in project.layers" :key="layer.id" class="layer-card" :class="{active:selectedLayerId===layer.id,disabled:!layer.enabled}" @click="selectedLayerId=layer.id;selectedConstraintId=layer.constraints[0]?.id??''">
