@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, toRaw, watch } from 'vue'
 import {
   Aperture, ArrowDownToLine, ArrowLeftRight, Check, ChevronDown, ChevronUp, Copy,
   Eye, EyeOff, FileImage, FolderOpen, Gauge, Layers3, Minus, MousePointer2, Plus,
@@ -18,7 +18,8 @@ import { createLayer, experimentPresets } from '../experiments/presets'
 interface WorkerResult {id:string;name:string;rgba:Uint8ClampedArray;corrected:Uint8ClampedArray;processingMs:number;outOfGamutRate:number;thumbnails:{id:string;rgba:Uint8Array}[];diagnostics:{id:string;effectiveMode:string;condition:number;stable:boolean;residualMagnitude:number;colorSpread:number;constraintCount:number;coefficients:number[][]}[]}
 interface WorkerResponse {type:string;requestId?:number;width?:number;height?:number;results?:WorkerResult[];message?:string}
 const emptyProject=():Project=>({version:1,image:{name:'Untitled photo',width:0,height:0,fingerprint:'',mimeType:''},layers:[],pipeline:{...DEFAULT_PIPELINE},comparePresetIds:['shared-context','spatial-only','color-context']})
-const project=ref<Project>(emptyProject()),history=new CommandHistory(project.value)
+function clonePlain<T>(value:T):T{return structuredClone(toRaw(value))}
+const project=ref<Project>(emptyProject()),history=new CommandHistory(project.value,clonePlain)
 const worker=new Worker(new URL('../workers/pipeline.worker.ts',import.meta.url),{type:'module'})
 const sourcePixels=ref<Uint8ClampedArray|null>(null),preview=ref<Uint8ClampedArray|null>(null),correctedPixels=ref<Uint8ClampedArray|null>(null)
 const compareResults=ref<WorkerResult[]>([]),thumbnailMap=ref<Record<string,Uint8Array>>({})
@@ -73,7 +74,7 @@ function scheduleRender(){
   isRendering.value=true
   renderTimer=window.setTimeout(()=>{
     const id=++requestId;latestRequest=id
-    worker.postMessage({type:'render',requestId:id,layers:structuredClone(project.value.layers),pipeline:structuredClone(project.value.pipeline),variants:activeVariants(),view:view.value,selectedLayerId:selectedLayerId.value,selectedConstraintId:selectedConstraintId.value})
+    worker.postMessage({type:'render',requestId:id,layers:clonePlain(project.value.layers),pipeline:clonePlain(project.value.pipeline),variants:activeVariants(),view:view.value,selectedLayerId:selectedLayerId.value,selectedConstraintId:selectedConstraintId.value})
   },80)
 }
 watch([project,view,selectedLayerId,selectedConstraintId,compareMode,selectedPresetIds],scheduleRender,{deep:true})
@@ -90,9 +91,9 @@ async function loadPhoto(file:File){
     const data=new Uint8ClampedArray(image.data),fingerprint=fingerprintImage(data,canvas.width,canvas.height)
     loadedImageFingerprint.value=fingerprint
     sourcePixels.value=data;preview.value=null;correctedPixels.value=null;compareResults.value=[];thumbnailMap.value={};pan.value={x:0,y:0}
-    const loaded=project.value.image.fingerprint===fingerprint&&project.value.layers.length>0?project.value:emptyProject()
+    const loaded=project.value.image.fingerprint===fingerprint&&project.value.layers.length>0?clonePlain(project.value):emptyProject()
     loaded.image={name:file.name,width:canvas.width,height:canvas.height,fingerprint,mimeType:file.type||'image/*'}
-    project.value=structuredClone(loaded);history.replace('Load photo',project.value)
+    project.value=loaded;history.replace('Load photo',project.value)
     selectedLayerId.value=project.value.layers[0]?.id??'';selectedConstraintId.value=project.value.layers[0]?.constraints[0]?.id??''
     const transferCopy=data.slice()
     worker.postMessage({type:'set-image',width:canvas.width,height:canvas.height,data:transferCopy.buffer,name:file.name,fingerprint},[transferCopy.buffer])
@@ -114,7 +115,7 @@ function onProjectFile(event:Event){
   };reader.readAsText(file);(event.target as HTMLInputElement).value=''
 }
 function saveProject(){
-  const value={...project.value,comparePresetIds:[...selectedPresetIds.value]},url=URL.createObjectURL(new Blob([serializeProject(value)],{type:'application/json'})),a=document.createElement('a')
+  const value={...clonePlain(project.value),comparePresetIds:[...selectedPresetIds.value]},url=URL.createObjectURL(new Blob([serializeProject(value)],{type:'application/json'})),a=document.createElement('a')
   a.href=url;a.download=`${project.value.image.name.replace(/\.[^.]+$/,'')||'prism-project'}.prism.json`;a.click();URL.revokeObjectURL(url)
 }
 function exportPng(){
@@ -200,7 +201,7 @@ function deleteLayer(id:string){
   const next=project.value.layers[Math.max(0,index-1)]??project.value.layers[0];selectedLayerId.value=next?.id??'';selectedConstraintId.value=next?.constraints[0]?.id??''
 }
 function duplicateLayer(layer:CorrectionLayer){
-  const duplicate=structuredClone(layer);duplicate.id=crypto.randomUUID();duplicate.name=`${layer.name} copy`;duplicate.constraints=duplicate.constraints.map(c=>({...c,id:crypto.randomUUID()}));duplicate.activationHints=duplicate.activationHints.map(h=>({...h,id:crypto.randomUUID()}))
+  const duplicate=clonePlain(layer);duplicate.id=crypto.randomUUID();duplicate.name=`${layer.name} copy`;duplicate.constraints=duplicate.constraints.map(c=>({...c,id:crypto.randomUUID()}));duplicate.activationHints=duplicate.activationHints.map(h=>({...h,id:crypto.randomUUID()}))
   commit('Duplicate correction layer',current=>({...current,layers:[...current.layers,duplicate]}));selectedLayerId.value=duplicate.id;selectedConstraintId.value=duplicate.constraints[0]?.id??''
 }
 function reorderLayer(id:string,direction:-1|1){
@@ -242,7 +243,7 @@ function setHintRadius(layerId:string,hintId:string,event:Event){const radius=Nu
 function moveConstraintToLayer(event:Event){
   if(!selectedConstraint.value||!activeLayer.value)return
   const targetId=(event.target as HTMLSelectElement).value;if(!targetId||targetId===activeLayer.value.id)return
-  const sourceId=activeLayer.value.id,constraint=structuredClone(selectedConstraint.value)
+  const sourceId=activeLayer.value.id,constraint=clonePlain(selectedConstraint.value)
   commit('Move constraint to layer',current=>({...current,layers:current.layers.map(layer=>layer.id===sourceId?{...layer,constraints:layer.constraints.filter(c=>c.id!==constraint.id)}:layer.id===targetId?{...layer,constraints:[...layer.constraints,constraint]}:layer)}))
   selectedLayerId.value=targetId;selectedConstraintId.value=constraint.id
 }
