@@ -48,5 +48,6 @@ pnpm preview
 - [`docs/algorithm.md`](docs/algorithm.md)
 - [`docs/pipeline-config.md`](docs/pipeline-config.md)
 - [`docs/experiments.md`](docs/experiments.md)
+- [`docs/research-stage-summary.md`](docs/research-stage-summary.md)
 
 实验 presets、synthetic fixture 生成器和 metrics hook 位于 `experiments/` 及 `src/experiments/`。研究定位以仓库中的 v0.3/v0.4 设计文档为准；当前 Gaussian context affinity 是可替换的 baseline，不宣称已经解决 transform-regime 推断。
