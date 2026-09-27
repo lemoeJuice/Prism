@@ -6,6 +6,10 @@ Prism 是一个纯前端、研究导向且可实际使用的照片颜色校正�
 
 需要 Node.js 20+、pnpm 10+ 和支持 WebGL2 的现代浏览器。
 
+## GitHub Pages 部署
+
+`.github/workflows/deploy-pages.yml` 会在推送到 `main` 或手动触发时运行测试、构建并部署到 GitHub Pages。首次启用时，在仓库 **Settings → Pages → Build and deployment** 中将 **Source** 设为 **GitHub Actions**。本仓库名为 `Prism`，CI 构建会使用 `/Prism/` 作为站点 base path；本地开发仍使用 `/`。
+
 ```bash
 pnpm install
 pnpm dev
